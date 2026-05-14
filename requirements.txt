@@ -1,0 +1,6 @@
+haystack-ai>=2.7.0
+openai>=1.40.0
+requests>=2.31.0
+Flask>=3.0.2
+python-dotenv>=1.0.1
+gunicorn>=22.0.0

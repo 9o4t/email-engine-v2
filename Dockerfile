@@ -1,0 +1,22 @@
+FROM python:3.12-slim
+
+ENV PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PIP_NO_CACHE_DIR=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1
+
+WORKDIR /app
+
+COPY requirements.txt /app/
+RUN pip install -r requirements.txt
+
+COPY src/ /app/src/
+COPY entrypoint.sh /app/
+RUN chmod +x /app/entrypoint.sh
+
+ENV FEEDBACK_DB_PATH=/data/email-engine-v2.db \
+    PORT=8000 \
+    PYTHONPATH=/app/src
+
+EXPOSE 8000
+CMD ["/app/entrypoint.sh"]
