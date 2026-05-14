@@ -78,11 +78,26 @@ class Provider(ABC):
         `limit` messages."""
 
     @abstractmethod
-    def list_folder(self, folder_name: str, since: datetime | None, limit: int) -> list[Message]:
+    def list_folder(
+        self,
+        folder_name: str,
+        since: datetime | None,
+        limit: int,
+        descending: bool = False,
+    ) -> list[Message]:
         """Like list_inbox but for ANY folder by display name. Used by the
         reclassify-all sweep to walk legacy v1 folders alongside INBOX so
         every email gets reprocessed through the new (thread-aware) logic.
-        Returns [] if the folder doesn't exist."""
+        Returns [] if the folder doesn't exist.
+
+        When descending=False (default, used by the forward-walking poller):
+          `since` is the lower bound — return messages with
+          receivedDateTime > since, oldest first.
+        When descending=True (used by reclassify so the newest threads
+        appear in the dashboard first):
+          `since` is the UPPER bound — return messages with
+          receivedDateTime < since, newest first.
+        Pass since=None to start from the absolute newest / oldest edge."""
 
     @abstractmethod
     def get_message(self, message_id: str) -> Message | None:

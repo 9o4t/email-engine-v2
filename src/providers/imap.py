@@ -81,9 +81,15 @@ class IMAPProvider(Provider):
     # --- reads --------------------------------------------------------------
 
     def list_inbox(self, since: datetime | None, limit: int) -> list[Message]:
-        return self.list_folder("INBOX", since, limit)
+        return self.list_folder("INBOX", since, limit, descending=False)
 
-    def list_folder(self, folder_name: str, since: datetime | None, limit: int) -> list[Message]:
+    def list_folder(
+        self,
+        folder_name: str,
+        since: datetime | None,
+        limit: int,
+        descending: bool = False,
+    ) -> list[Message]:
         c = _open(self._cfg)
         try:
             typ, _ = c.select(folder_name, readonly=True)
@@ -105,13 +111,17 @@ class IMAPProvider(Provider):
                 uids = uids[-limit:]
 
             out: list[Message] = []
-            for raw_uid in uids:
+            iter_uids = list(reversed(uids)) if descending else uids
+            for raw_uid in iter_uids:
                 uid = raw_uid.decode() if isinstance(raw_uid, bytes) else raw_uid
                 m = self._fetch_one(c, uid, source_folder=folder_name)
                 if not m:
                     continue
-                if since and m.received_at and m.received_at <= since:
-                    continue
+                if since and m.received_at:
+                    if descending and m.received_at >= since:
+                        continue
+                    if not descending and m.received_at <= since:
+                        continue
                 out.append(m)
             return out
         finally:

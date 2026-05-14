@@ -170,13 +170,21 @@ class GraphProvider(Provider):
     # --- reads --------------------------------------------------------------
 
     def list_inbox(self, since: datetime | None, limit: int) -> list[Message]:
-        return self.list_folder("inbox", since, limit)
+        return self.list_folder("inbox", since, limit, descending=False)
 
-    def list_folder(self, folder_name: str, since: datetime | None, limit: int) -> list[Message]:
+    def list_folder(
+        self,
+        folder_name: str,
+        since: datetime | None,
+        limit: int,
+        descending: bool = False,
+    ) -> list[Message]:
         """List messages in a folder. `folder_name` is either a well-known
         Graph alias ('inbox') or a displayName we locate. Returns [] if the
         folder doesn't exist (so the reclassify sweep can safely walk a list
-        of legacy folder names without crashing on the ones that aren't there)."""
+        of legacy folder names without crashing on the ones that aren't there).
+
+        Order + filter semantics flip with `descending` — see Provider.list_folder."""
         # Resolve folder identifier: 'inbox' is a Graph well-known alias;
         # everything else needs a displayName lookup.
         if folder_name.lower() == "inbox":
@@ -192,12 +200,13 @@ class GraphProvider(Provider):
         )
         q = {
             "$select": MESSAGE_SELECT,
-            "$orderby": "receivedDateTime asc",
+            "$orderby": "receivedDateTime desc" if descending else "receivedDateTime asc",
             "$top": str(max(1, min(limit, 100))),
         }
         if since:
             iso = since.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-            q["$filter"] = f"receivedDateTime gt {iso}"
+            op = "lt" if descending else "gt"
+            q["$filter"] = f"receivedDateTime {op} {iso}"
         url = endpoint + "?" + _qs(q)
         data = _do_json(self._broker, "GET", url) or {}
         return [_msg_from_graph(m) for m in data.get("value", [])]

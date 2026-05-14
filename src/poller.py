@@ -335,20 +335,23 @@ def reclassify_all(mailbox_email: str, store: Store | None = None, llm: LLMConfi
     seen: set[str] = set()
     counts = {"folders_walked": 0, "threads_classified": 0, "errors": 0}
 
-    log.info("[reclassify] starting for %s across %d folder(s)", mb.mailbox, len(folders_to_walk))
+    log.info("[reclassify] starting for %s across %d folder(s) (newest-first)",
+             mb.mailbox, len(folders_to_walk))
 
     for folder in folders_to_walk:
         if _STOP:
             log.info("[reclassify] stop signal — abort mid-folder %s", folder)
             break
         counts["folders_walked"] += 1
-        # Paginate by received-time so we can checkpoint progress in logs.
+        # Walk NEWEST → OLDEST so the dashboard fills up with recognizable
+        # recent threads first; cursor tracks the OLDEST received_at seen
+        # so the next page asks for messages strictly older than that.
         cursor: datetime | None = None
         while True:
             if _STOP:
                 break
             try:
-                batch = provider.list_folder(folder, cursor, page)
+                batch = provider.list_folder(folder, cursor, page, descending=True)
             except Exception as e:
                 log.exception("[reclassify] list %s failed: %s", folder, e)
                 counts["errors"] += 1
@@ -359,7 +362,7 @@ def reclassify_all(mailbox_email: str, store: Store | None = None, llm: LLMConfi
                 if _STOP:
                     break
                 if m.conversation_id and m.conversation_id in seen:
-                    if m.received_at and (cursor is None or m.received_at > cursor):
+                    if m.received_at and (cursor is None or m.received_at < cursor):
                         cursor = m.received_at
                     continue
                 if m.conversation_id:
@@ -371,7 +374,7 @@ def reclassify_all(mailbox_email: str, store: Store | None = None, llm: LLMConfi
                     log.exception("[reclassify] %s/%s thread failed: %s",
                                   folder, m.id[:24], e)
                     counts["errors"] += 1
-                if m.received_at and (cursor is None or m.received_at > cursor):
+                if m.received_at and (cursor is None or m.received_at < cursor):
                     cursor = m.received_at
             if len(batch) < page:
                 break
