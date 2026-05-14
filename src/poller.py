@@ -335,8 +335,15 @@ def reclassify_all(mailbox_email: str, store: Store | None = None, llm: LLMConfi
     seen: set[str] = set()
     counts = {"folders_walked": 0, "threads_classified": 0, "errors": 0}
 
-    log.info("[reclassify] starting for %s across %d folder(s) (newest-first)",
-             mb.mailbox, len(folders_to_walk))
+    # Snapshot "now" and advance the watermark up front so the forward
+    # poller stops chewing through old INBOX mail behind us. Anything that
+    # lands AFTER this moment will be picked up by the next forward poll;
+    # reclassify owns everything older.
+    started_at = datetime.now(timezone.utc)
+    store.set_watermark(mb.mailbox, started_at)
+
+    log.info("[reclassify] starting for %s across %d folder(s) (newest-first, watermark→%s)",
+             mb.mailbox, len(folders_to_walk), started_at.isoformat())
 
     for folder in folders_to_walk:
         if _STOP:
@@ -346,7 +353,9 @@ def reclassify_all(mailbox_email: str, store: Store | None = None, llm: LLMConfi
         # Walk NEWEST → OLDEST so the dashboard fills up with recognizable
         # recent threads first; cursor tracks the OLDEST received_at seen
         # so the next page asks for messages strictly older than that.
-        cursor: datetime | None = None
+        # First page asks for messages received BEFORE `started_at` so any
+        # message arriving during reclassify falls to the forward poller.
+        cursor: datetime | None = started_at
         while True:
             if _STOP:
                 break
@@ -381,9 +390,9 @@ def reclassify_all(mailbox_email: str, store: Store | None = None, llm: LLMConfi
         log.info("[reclassify] folder %s done (threads=%d errors=%d)",
                  folder, counts["threads_classified"], counts["errors"])
 
-    # Watermark = "we just processed everything"; next poll cycle picks up
-    # only genuinely new messages.
-    store.set_watermark(mb.mailbox, datetime.now(timezone.utc))
+    # Watermark stays at `started_at` — any message received during the
+    # reclassify run is strictly newer than that and gets picked up by the
+    # next forward poll cycle, so nothing falls through the crack.
 
     log.info("[reclassify] %s complete: %s", mb.mailbox, counts)
     counts["ok"] = True
