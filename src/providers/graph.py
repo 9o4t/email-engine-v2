@@ -170,7 +170,26 @@ class GraphProvider(Provider):
     # --- reads --------------------------------------------------------------
 
     def list_inbox(self, since: datetime | None, limit: int) -> list[Message]:
-        endpoint = f"{GRAPH_API_BASE}/users/{quote(self._email)}/mailFolders/inbox/messages"
+        return self.list_folder("inbox", since, limit)
+
+    def list_folder(self, folder_name: str, since: datetime | None, limit: int) -> list[Message]:
+        """List messages in a folder. `folder_name` is either a well-known
+        Graph alias ('inbox') or a displayName we locate. Returns [] if the
+        folder doesn't exist (so the reclassify sweep can safely walk a list
+        of legacy folder names without crashing on the ones that aren't there)."""
+        # Resolve folder identifier: 'inbox' is a Graph well-known alias;
+        # everything else needs a displayName lookup.
+        if folder_name.lower() == "inbox":
+            folder_id = "inbox"
+        else:
+            folder_id = self._find_folder_id(folder_name)
+            if not folder_id:
+                return []
+
+        endpoint = (
+            f"{GRAPH_API_BASE}/users/{quote(self._email)}"
+            f"/mailFolders/{quote(folder_id, safe='')}/messages"
+        )
         q = {
             "$select": MESSAGE_SELECT,
             "$orderby": "receivedDateTime asc",
@@ -182,6 +201,24 @@ class GraphProvider(Provider):
         url = endpoint + "?" + _qs(q)
         data = _do_json(self._broker, "GET", url) or {}
         return [_msg_from_graph(m) for m in data.get("value", [])]
+
+    def _find_folder_id(self, name: str) -> str:
+        """Best-effort lookup: check inbox children first, then root folders."""
+        if name in self._folder_cache:
+            return self._folder_cache[name]
+        inbox_id = self._get_folder_id("inbox")
+        fid = self._search_folder(
+            f"{GRAPH_API_BASE}/users/{quote(self._email)}/mailFolders/{inbox_id}/childFolders",
+            name,
+        )
+        if not fid:
+            fid = self._search_folder(
+                f"{GRAPH_API_BASE}/users/{quote(self._email)}/mailFolders",
+                name,
+            )
+        if fid:
+            self._folder_cache[name] = fid
+        return fid
 
     def get_message(self, message_id: str) -> Message | None:
         endpoint = (

@@ -22,7 +22,9 @@ from __future__ import annotations
 import csv
 import io
 import json
+import logging
 import os
+import threading
 from functools import wraps
 
 from dotenv import load_dotenv
@@ -31,6 +33,15 @@ from flask import Flask, Response, abort, jsonify, render_template_string, reque
 from classifier import hierarchy_path_for, invalidate_cache, list_folders
 from lib.apply import APPLY_MODES
 from lib.storage import MailboxConfig, Store
+from poller import reclassify_all
+
+
+log = logging.getLogger(__name__)
+
+
+# Reclassify status (in-memory; one job at a time per mailbox).
+_reclassify_lock = threading.Lock()
+_reclassify_state: dict[str, dict] = {}  # mailbox → status dict
 
 
 load_dotenv()
@@ -195,6 +206,55 @@ def mailboxes_delete(email: str):
     return Response(status=303, headers={"Location": "/mailboxes"})
 
 
+@app.post("/mailboxes/<path:email>/reclassify")
+@_require_auth
+def mailboxes_reclassify(email: str):
+    """Kick off a reclassify-all in a background thread. One job per
+    mailbox at a time — second click while running is a no-op."""
+    if not store.get_mailbox(email):
+        abort(404, "unknown mailbox")
+    with _reclassify_lock:
+        cur = _reclassify_state.get(email)
+        if cur and cur.get("running"):
+            return Response(status=303, headers={"Location": "/mailboxes?msg=already-running"})
+        _reclassify_state[email] = {"running": True, "started_at": _now_iso(), "summary": None, "error": None}
+
+    def _worker():
+        try:
+            summary = reclassify_all(email)
+            with _reclassify_lock:
+                _reclassify_state[email] = {
+                    "running": False,
+                    "started_at": _reclassify_state[email].get("started_at"),
+                    "finished_at": _now_iso(),
+                    "summary": summary, "error": None,
+                }
+        except Exception as e:
+            log.exception("reclassify worker failed: %s", e)
+            with _reclassify_lock:
+                _reclassify_state[email] = {
+                    "running": False,
+                    "started_at": _reclassify_state[email].get("started_at"),
+                    "finished_at": _now_iso(),
+                    "summary": None, "error": str(e),
+                }
+
+    threading.Thread(target=_worker, daemon=True, name=f"reclassify-{email}").start()
+    return Response(status=303, headers={"Location": "/mailboxes?msg=reclassify-started"})
+
+
+@app.get("/api/reclassify/<path:email>/status")
+@_require_auth
+def reclassify_status(email: str):
+    with _reclassify_lock:
+        return jsonify(_reclassify_state.get(email, {"running": False, "summary": None}))
+
+
+def _now_iso() -> str:
+    from datetime import datetime, timezone
+    return datetime.now(timezone.utc).isoformat()
+
+
 # --- Hierarchy (read-only view; edit JSON files for now) -------------------
 
 @app.get("/hierarchies/<path:email>")
@@ -308,8 +368,17 @@ _MAILBOXES_HTML = """\
   .add { background: #f8f8fc; padding: 12px; border-radius: 6px; }
   code { background: #f0f0f4; padding: 1px 4px; border-radius: 3px; }
   .help { color: #666; font-size: 0.85rem; }
+  .banner { background: #fff8e0; border-left: 3px solid #d8a20a; padding: 8px 12px; margin: 0 0 1rem; font-size: 0.9rem; }
+  .banner.ok { background: #e8f8ee; border-color: #1a9b4a; }
+  .reclass { font-size: 0.8rem; background: #f0f4ff; border: 1px solid #b9c5ec; }
+  .reclass-status { font-size: 0.8rem; color: #555; margin-top: 4px; }
 </style>
 """ + _NAV + """\
+{% if request.args.get('msg') == 'reclassify-started' %}
+  <div class="banner ok">Reclassify started — walks INBOX + every legacy <code>…-X</code> folder. Watch <a href="/">decisions</a> or poll <code>/api/reclassify/&lt;email&gt;/status</code>.</div>
+{% elif request.args.get('msg') == 'already-running' %}
+  <div class="banner">A reclassify is already in flight for that mailbox — second click ignored.</div>
+{% endif %}
 <h1>Mailboxes</h1>
 
 <table>
@@ -351,10 +420,16 @@ _MAILBOXES_HTML = """\
     </form>
     <tr>
       <td colspan="7" style="border-bottom: 2px solid #f0f0f0; padding-bottom: 12px;">
-        <form method="post" action="/mailboxes/{{ m.mailbox }}/delete" style="display:inline" onsubmit="return confirm('Remove this mailbox? Decisions stay, polling stops.')">
+        <form method="post" action="/mailboxes/{{ m.mailbox }}/reclassify" style="display:inline"
+              onsubmit="return confirm('Reclassify ALL emails in INBOX plus every legacy ...-X folder for {{ m.mailbox }}? This walks every thread once through the new logic. Existing folder contents will move based on the new verdict.')">
+          <button type="submit" class="reclass">↻ Reclassify all</button>
+        </form>
+        <form method="post" action="/mailboxes/{{ m.mailbox }}/delete" style="display:inline"
+              onsubmit="return confirm('Remove this mailbox? Decisions stay, polling stops.')">
           <button type="submit" style="font-size:0.75rem;color:#a00">delete</button>
         </form>
         <span class="help">{{ m.notes }}</span>
+        <div class="reclass-status" id="status-{{ m.mailbox }}"></div>
       </td>
     </tr>
   {% endfor %}
@@ -389,6 +464,33 @@ _MAILBOXES_HTML = """\
 <p class="help">For <strong>graph</strong>: token broker must be configured (<code>CALENDAR_URL</code> + <code>B2B_TOKEN</code> env vars); IMAP fields ignored.<br>
 For <strong>imap</strong>: set <code>IMAP_&lt;SANITIZED_EMAIL&gt;_PASSWORD</code> in Railway secrets (e.g. <code>IMAP_DAVE_GMAIL_COM_PASSWORD</code>).</p>
 </div>
+
+<script>
+// Poll reclassify status every 4s for each mailbox row.
+(function () {
+  const mailboxes = {{ mailboxes | map(attribute='mailbox') | list | tojson }};
+  function fmt(s) {
+    if (!s) return '';
+    if (s.running) return `… reclassifying (started ${s.started_at?.slice(11,19) || ''}Z)`;
+    if (s.error)   return `✗ last reclassify error: ${s.error}`;
+    if (s.summary) return `✓ last reclassify: ${s.summary.threads_classified || 0} thread(s), ${s.summary.errors || 0} error(s) across ${s.summary.folders_walked || 0} folder(s)`;
+    return '';
+  }
+  async function tick() {
+    for (const mb of mailboxes) {
+      try {
+        const r = await fetch(`/api/reclassify/${encodeURIComponent(mb)}/status`);
+        if (!r.ok) continue;
+        const j = await r.json();
+        const el = document.getElementById(`status-${mb}`);
+        if (el) el.textContent = fmt(j);
+      } catch (_) {}
+    }
+  }
+  tick();
+  setInterval(tick, 4000);
+})();
+</script>
 """
 
 

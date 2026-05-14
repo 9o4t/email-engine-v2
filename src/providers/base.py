@@ -78,6 +78,13 @@ class Provider(ABC):
         `limit` messages."""
 
     @abstractmethod
+    def list_folder(self, folder_name: str, since: datetime | None, limit: int) -> list[Message]:
+        """Like list_inbox but for ANY folder by display name. Used by the
+        reclassify-all sweep to walk legacy v1 folders alongside INBOX so
+        every email gets reprocessed through the new (thread-aware) logic.
+        Returns [] if the folder doesn't exist."""
+
+    @abstractmethod
     def get_message(self, message_id: str) -> Message | None:
         """Fetch one message by its native id. Returns None on 404."""
 
@@ -115,3 +122,21 @@ def sanitize_mailbox(mailbox: str) -> str:
     """Stable filename stem for a mailbox: lowercase, non-alnum → '_'.
     Used for per-mailbox hierarchy JSON files."""
     return re.sub(r"[^A-Za-z0-9]+", "_", mailbox.strip().lower()).strip("_")
+
+
+# Legacy v1 folder names. Reclassify-all sweeps these too so emails the
+# previous engine sorted get reprocessed by the new (thread-aware) logic.
+# When the taxonomy changes again, append the retired names here.
+LEGACY_RULE_FOLDERS = (
+    "1-CRITICAL-X",
+    "2-HIGH-PRIORITY-X",
+    "3-PERSONAL-&-IMPORTANT-X",
+    "4-MEDIUM-/-BATCH-X",
+    "5-LOW-IGNORE-X",
+    # Earlier underscore-prefixed v1 generation
+    "_1-CRITICAL-X",
+    "_2-HIGH-PRIORITY-X",
+    "_3-PERSONAL-&-IMPORTANT-X",
+    "_4-MEDIUM-/-BATCH-X",
+    "_5-LOW-IGNORE-X",
+)

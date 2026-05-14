@@ -202,6 +202,25 @@ class Store:
                 (mailbox, iso),
             )
 
+    def reset_watermark(self, mailbox: str) -> None:
+        """Drop the watermark so the next poll walks the inbox from the start."""
+        with self._conn() as c:
+            c.execute("DELETE FROM watermarks WHERE mailbox = ?", (mailbox,))
+
+    def delete_decisions_for_thread(self, mailbox: str, conversation_id: str) -> int:
+        """Drop prior decision rows for a thread so a re-classification can
+        rewrite them with the new verdict (matches v1's behavior). Without
+        this, reclassifying a thread would leave stale rows alongside the
+        new ones, and the dashboard would show conflicting answers."""
+        if not conversation_id:
+            return 0
+        with self._conn() as c:
+            cur = c.execute(
+                "DELETE FROM decisions WHERE mailbox = ? AND conversation_id = ?",
+                (mailbox, conversation_id),
+            )
+        return cur.rowcount
+
     # --- decisions ----------------------------------------------------------
 
     def insert_decision(

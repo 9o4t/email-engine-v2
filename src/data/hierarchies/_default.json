@@ -1,50 +1,50 @@
 {
-    "_note": "Default folder taxonomy. Copy this file to '<sanitized_mailbox>.json' (e.g. dave_9o4t_com.json) and edit per-mailbox. Each leaf becomes a destination folder + matching category tag. Descriptions are what BM25 retrieves over — make them long, specific, and word-rich.",
+    "_note": "Default folder taxonomy. Copy to '<sanitized_mailbox>.json' (e.g. david_cullum_honeststok_com.json) and edit per-mailbox. Each leaf becomes a destination folder AND its matching category tag (identical strings). Descriptions are what BM25 retrieves over — make them long, specific, word-rich.",
 
     "nodes": [
         {
             "name": "root",
-            "description": "Root taxonomy for an executive personal mailbox. Every inbound email is classified into one of the five priority folders below.",
+            "description": "Root taxonomy for an executive personal mailbox. Every inbound email is classified into one of the five priority folders below. Decisions apply to the WHOLE THREAD — older messages get re-tagged and re-filed when the conversation's state changes.",
             "is_leaf": false,
             "children": [
-                "1-CRITICAL-X",
-                "2-HIGH-PRIORITY-X",
-                "3-PERSONAL-&-IMPORTANT-X",
-                "4-MEDIUM-/-BATCH-X",
-                "5-LOW-IGNORE-X"
+                "1-Critical",
+                "2-High-Priority",
+                "3-Personal",
+                "4-Medium",
+                "5-Low-Ignore"
             ]
         },
         {
-            "name": "1-CRITICAL-X",
-            "id": "1-CRITICAL-X",
+            "name": "1-Critical",
+            "id": "1-Critical",
             "description": "Must act today. Real action by THIS executive personally is required within hours. Includes: production outages, customer escalations, OTP / login codes / 2FA / verification codes (always critical, even if 'do not reply' is in the body), contracts about to lapse, money at stake, legal threats, deals closing today, security incidents, executive assistant cannot handle on their own. Indirect references to the executive by name or pronoun ('give Dave a moment', 'ask the CEO') on a thread about a critical topic also belong here. OTPs go here even when paired with security warnings.",
             "is_leaf": true,
             "children": []
         },
         {
-            "name": "2-HIGH-PRIORITY-X",
-            "id": "2-HIGH-PRIORITY-X",
+            "name": "2-High-Priority",
+            "id": "2-High-Priority",
             "description": "Needs a personal response within ~48 hours. Proposals, partnership / interview / deal asks, scheduled meeting requests, document approvals with a near-term deadline, support tickets the executive personally opened with a vendor (auto-acknowledgement emails with [Ticket received], Case #, Ref:, 'We received your request' on a topic the executive cares about — pricing, trial, contract, billing, integration). The executive is awaiting a human follow-up they need to act on. Generic newsletter-style 'thanks for signing up' with no open ticket does NOT belong here.",
             "is_leaf": true,
             "children": []
         },
         {
-            "name": "3-PERSONAL-&-IMPORTANT-X",
-            "id": "3-PERSONAL-&-IMPORTANT-X",
+            "name": "3-Personal",
+            "id": "3-Personal",
             "description": "Friends, family, personal life obligations. Doctor, school, mortgage, bank, dentist, medical, kids' activities, family events, personal travel, personal finance (not work finance), personal subscriptions to services the executive uses individually. Anything from a personal contact whose relationship to the executive is non-work.",
             "is_leaf": true,
             "children": []
         },
         {
-            "name": "4-MEDIUM-/-BATCH-X",
-            "id": "4-MEDIUM-/-BATCH-X",
-            "description": "Routine work that can wait until a batch-triage session. FYI updates, status reports, low-urgency questions, internal CCs where the executive is only kept in the loop and not asked anything, resolved threads (already handled by a delegate or EA who said 'got it' / 'handled' / 'I'll take this'), informational replies on a thread that is no longer awaiting executive action. Threads where someone other than the executive has already promised the work is demoted here.",
+            "name": "4-Medium",
+            "id": "4-Medium",
+            "description": "Routine work that can wait until a batch-triage session. FYI updates, status reports, low-urgency questions, internal CCs where the executive is only kept in the loop and not asked anything, resolved threads (already handled by a delegate or EA who said 'got it' / 'handled' / 'I'll take this'), informational replies on a thread that is no longer awaiting executive action. Threads where someone other than the executive has already promised the work is demoted here. When a colleague has already replied with 'I'll handle this' or similar, the whole thread demotes.",
             "is_leaf": true,
             "children": []
         },
         {
-            "name": "5-LOW-IGNORE-X",
-            "id": "5-LOW-IGNORE-X",
+            "name": "5-Low-Ignore",
+            "id": "5-Low-Ignore",
             "description": "Promotional, automated, bulk-sent, or marketing. Newsletters, marketing campaigns, flash sales, generic announcements, supplier webinar invitations ('join us today', 'register now' — urgency words in marketing context do NOT make it critical), event invites the executive doesn't personally need to attend, no-reply / donotreply / marketing@ / unsubscribe-footer senders, tracking-pixel-heavy URLs, bulk fundraising appeals. Safe to archive. Bulk-sender signals always override urgency wording in the body.",
             "is_leaf": true,
             "children": []

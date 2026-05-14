@@ -81,9 +81,12 @@ class IMAPProvider(Provider):
     # --- reads --------------------------------------------------------------
 
     def list_inbox(self, since: datetime | None, limit: int) -> list[Message]:
+        return self.list_folder("INBOX", since, limit)
+
+    def list_folder(self, folder_name: str, since: datetime | None, limit: int) -> list[Message]:
         c = _open(self._cfg)
         try:
-            typ, _ = c.select("INBOX", readonly=True)
+            typ, _ = c.select(folder_name, readonly=True)
             if typ != "OK":
                 return []
             criteria = ["ALL"]
@@ -104,7 +107,7 @@ class IMAPProvider(Provider):
             out: list[Message] = []
             for raw_uid in uids:
                 uid = raw_uid.decode() if isinstance(raw_uid, bytes) else raw_uid
-                m = self._fetch_one(c, uid, source_folder="INBOX")
+                m = self._fetch_one(c, uid, source_folder=folder_name)
                 if not m:
                     continue
                 if since and m.received_at and m.received_at <= since:
