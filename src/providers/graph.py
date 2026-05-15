@@ -275,6 +275,14 @@ class GraphProvider(Provider):
     def ensure_folder(self, name: str) -> str:
         if name in self._folder_cache:
             return self._folder_cache[name]
+        # Well-known aliases: "inbox" (any case) resolves to the user's real
+        # Inbox via Graph's reserved name, NOT to a child folder named "Inbox".
+        # Without this, move_message(_, "INBOX") would silently create a fresh
+        # folder literally called INBOX as a sibling of the real Inbox.
+        if name.lower() == "inbox":
+            inbox_id = self._get_folder_id("inbox")
+            self._folder_cache[name] = inbox_id
+            return inbox_id
         # Look under inbox first, then root.
         inbox_id = self._get_folder_id("inbox")
         fid = self._search_folder(

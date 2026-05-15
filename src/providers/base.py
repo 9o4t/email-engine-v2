@@ -122,6 +122,65 @@ class Provider(ABC):
         Returns the new message id (some backends mint a fresh one).
         If the message is already there, no-op and returns the original id."""
 
+    def sweep_folder_to_inbox(
+        self,
+        source_folder: str,
+        progress: dict | None = None,
+    ) -> dict:
+        """Move every message in `source_folder` to the well-known Inbox.
+        Per-message Graph/IMAP MOVE — there's no bulk endpoint, so this
+        loops. Counts are returned (and optionally mirrored to `progress`
+        as it runs so the UI can show live progress).
+
+        Default implementation walks list_folder() in pages and calls
+        move_message(). Providers can override for native bulk APIs if
+        any backend ever adds one."""
+        from datetime import datetime, timezone
+        out = {
+            "source_folder": source_folder,
+            "moved": 0,
+            "errors": 0,
+            "last_error": None,
+            "started_at": datetime.now(timezone.utc).isoformat(),
+            "finished_at": None,
+            "done": False,
+        }
+        if progress is not None:
+            progress.update(out)
+
+        # We don't paginate by cursor here because every iteration removes
+        # the messages we just processed — the next list_folder call
+        # naturally returns the next batch from the (now-shrinking) folder.
+        while True:
+            try:
+                batch = self.list_folder(source_folder, since=None, limit=100, descending=True)
+            except Exception as e:
+                out["errors"] += 1
+                out["last_error"] = f"list_folder: {e}"
+                if progress is not None:
+                    progress.update(out)
+                break
+            if not batch:
+                break
+            for m in batch:
+                try:
+                    self.move_message(m.id, "INBOX")
+                    out["moved"] += 1
+                except Exception as e:
+                    out["errors"] += 1
+                    out["last_error"] = f"move {m.id[:24]}: {e}"
+                if progress is not None:
+                    progress["moved"] = out["moved"]
+                    progress["errors"] = out["errors"]
+                    progress["last_error"] = out["last_error"]
+
+        from datetime import datetime as _dt, timezone as _tz
+        out["finished_at"] = _dt.now(_tz.utc).isoformat()
+        out["done"] = True
+        if progress is not None:
+            progress.update(out)
+        return out
+
     # Optional capabilities — providers may override for richer behavior.
 
     def supports_categories(self) -> bool:

@@ -43,6 +43,10 @@ log = logging.getLogger(__name__)
 _reclassify_lock = threading.Lock()
 _reclassify_state: dict[str, dict] = {}  # mailbox → status dict
 
+# Sweep-to-inbox status (one job at a time per mailbox).
+_sweep_lock = threading.Lock()
+_sweep_state: dict[str, dict] = {}      # mailbox → status dict
+
 
 load_dotenv()
 app = Flask(__name__)
@@ -277,6 +281,72 @@ def reclassify_status(email: str):
         return jsonify(_reclassify_state.get(email, {"running": False, "summary": None}))
 
 
+# --- Sweep folder → Inbox ---------------------------------------------------
+
+@app.post("/mailboxes/<path:email>/sweep-to-inbox")
+@_require_auth
+def mailboxes_sweep_to_inbox(email: str):
+    """Move every message in `from_folder` to the well-known Inbox.
+
+    Form param `from_folder` (required, str): displayName of the source
+    folder. Common use case: cleaning up stray folders that v1 (or a
+    manual mistake) left behind — e.g. a literal '_inbox' folder created
+    by an old quirky classifier."""
+    mb = store.get_mailbox(email)
+    if not mb:
+        abort(404, "unknown mailbox")
+    from_folder = (request.form.get("from_folder") or "").strip()
+    if not from_folder:
+        abort(400, "from_folder is required")
+    if from_folder.strip().lower() == "inbox":
+        abort(400, "source folder cannot be the inbox itself")
+
+    with _sweep_lock:
+        cur = _sweep_state.get(email)
+        if cur and cur.get("running"):
+            return Response(status=303, headers={"Location": "/mailboxes?msg=sweep-already-running"})
+        state = {
+            "running": True,
+            "from_folder": from_folder,
+            "started_at": _now_iso(),
+            "finished_at": None,
+            "progress": {
+                "source_folder": from_folder,
+                "moved": 0, "errors": 0, "last_error": None, "done": False,
+            },
+            "error": None,
+        }
+        _sweep_state[email] = state
+
+    def _worker():
+        try:
+            from providers import make_provider
+            provider = make_provider(
+                mb.mailbox, mb.provider,
+                imap_server=mb.imap_server, imap_port=mb.imap_port,
+            )
+            provider.sweep_folder_to_inbox(from_folder, progress=state["progress"])
+            with _sweep_lock:
+                state["running"] = False
+                state["finished_at"] = _now_iso()
+        except Exception as e:
+            log.exception("sweep worker failed: %s", e)
+            with _sweep_lock:
+                state["running"] = False
+                state["finished_at"] = _now_iso()
+                state["error"] = str(e)
+
+    threading.Thread(target=_worker, daemon=True, name=f"sweep-{email}").start()
+    return Response(status=303, headers={"Location": "/mailboxes?msg=sweep-started"})
+
+
+@app.get("/api/sweep/<path:email>/status")
+@_require_auth
+def sweep_status(email: str):
+    with _sweep_lock:
+        return jsonify(_sweep_state.get(email, {"running": False}))
+
+
 def _now_iso() -> str:
     from datetime import datetime, timezone
     return datetime.now(timezone.utc).isoformat()
@@ -467,6 +537,10 @@ _MAILBOXES_HTML = """\
   <div class="banner ok">Reclassify started — walks INBOX + every legacy <code>…-X</code> folder. Watch <a href="/">decisions</a> or poll <code>/api/reclassify/&lt;email&gt;/status</code>.</div>
 {% elif request.args.get('msg') == 'already-running' %}
   <div class="banner">A reclassify is already in flight for that mailbox — second click ignored.</div>
+{% elif request.args.get('msg') == 'sweep-started' %}
+  <div class="banner ok">Sweep started — moving messages from the requested folder to Inbox in a background thread.</div>
+{% elif request.args.get('msg') == 'sweep-already-running' %}
+  <div class="banner">A sweep is already in flight for that mailbox — second click ignored.</div>
 {% endif %}
 <h1>Mailboxes</h1>
 
@@ -536,6 +610,15 @@ _MAILBOXES_HTML = """\
           <button type="submit" style="font-size:0.75rem;color:#a00">delete</button>
         </form>
         <span class="help">{{ m.notes }}</span>
+        <div style="margin-top: 8px;">
+          <form method="post" action="/mailboxes/{{ m.mailbox }}/sweep-to-inbox" style="display:inline-flex; gap:6px; align-items:center; flex-wrap:wrap;"
+                onsubmit="return confirm('Move every message in folder \\'' + this.from_folder.value + '\\' to ' + (this.from_folder.value.toLowerCase() === 'inbox' ? 'ERROR' : 'Inbox') + '? Per-message MOVE — runs in the background. Use for cleaning stray folders only.')">
+            <span class="help">Sweep folder → Inbox:</span>
+            <input type="text" name="from_folder" placeholder="e.g. _inbox" style="width:180px" required>
+            <button type="submit" class="reclass" style="font-size:0.75rem;padding:2px 8px">Move all to Inbox</button>
+          </form>
+          <div class="reclass-status" id="sweep-status-{{ m.mailbox }}"></div>
+        </div>
         <div class="reclass-card" id="card-{{ m.mailbox }}">
           <div><span class="dot" id="dot-{{ m.mailbox }}"></span><strong id="state-{{ m.mailbox }}">—</strong>
                <span class="help" style="margin-left:8px" id="scope-{{ m.mailbox }}"></span></div>
@@ -661,16 +744,36 @@ For <strong>imap</strong>: set <code>IMAP_&lt;SANITIZED_EMAIL&gt;_PASSWORD</code
     }
   }
 
+  function fmtSweep(s) {
+    if (!s) return '';
+    const src = s.from_folder ? `"${s.from_folder}" → Inbox` : '';
+    const p = s.progress || {};
+    if (s.running) return `… sweeping ${src}: moved ${p.moved || 0}, errors ${p.errors || 0}${p.last_error ? ' — ' + p.last_error : ''}`;
+    if (s.error)   return `✗ sweep ${src} error: ${s.error}`;
+    if (p.done)    return `✓ sweep ${src} done: moved ${p.moved || 0}, errors ${p.errors || 0}`;
+    return '';
+  }
+
   let pollMs = 8000;
   async function tick() {
     let anyRunning = false;
     for (const mb of mailboxes) {
       try {
         const r = await fetch(`/api/reclassify/${encodeURIComponent(mb)}/status`);
-        if (!r.ok) continue;
-        const j = await r.json();
-        render(mb, j);
-        if (j && j.running) anyRunning = true;
+        if (r.ok) {
+          const j = await r.json();
+          render(mb, j);
+          if (j && j.running) anyRunning = true;
+        }
+      } catch (_) {}
+      try {
+        const r2 = await fetch(`/api/sweep/${encodeURIComponent(mb)}/status`);
+        if (r2.ok) {
+          const j2 = await r2.json();
+          const el = document.getElementById(`sweep-status-${mb}`);
+          if (el) el.textContent = fmtSweep(j2);
+          if (j2 && j2.running) anyRunning = true;
+        }
       } catch (_) {}
     }
     pollMs = anyRunning ? 2000 : 8000;
