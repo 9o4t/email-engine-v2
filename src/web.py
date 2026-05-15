@@ -498,7 +498,10 @@ _HIERARCHY_HTML = """\
 <!doctype html><title>{{ mailbox }} — taxonomy</title>
 <style>
   body { font: 14px/1.45 -apple-system, system-ui, sans-serif; margin: 1.5rem; max-width: 900px; }
-  pre { background: #f8f8f8; padding: 12px; border-radius: 6px; overflow: auto; }
+  pre {
+    background: #f8f8f8; padding: 12px; border-radius: 6px;
+    white-space: pre-wrap; word-break: break-word; overflow-wrap: anywhere;
+  }
   .path { color: #666; font-size: 0.85rem; }
 </style>
 """ + _NAV + """\
