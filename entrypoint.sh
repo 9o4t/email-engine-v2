@@ -16,7 +16,8 @@ trap "kill -TERM $POLLER_PID 2>/dev/null || true" TERM INT
 exec gunicorn \
     --chdir /app/src \
     --bind "0.0.0.0:${PORT:-8000}" \
-    --workers 2 \
-    --timeout 30 \
+    --workers 1 \
+    --threads 4 \
+    --timeout 120 \
     --access-logfile - \
     web:app
