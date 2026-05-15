@@ -311,6 +311,7 @@ def reclassify_all(
     llm: LLMConfig | None = None,
     *,
     days_back: int | None = None,
+    progress: dict | None = None,
 ) -> dict:
     """One-shot reclassification: walk INBOX + every legacy v1 folder,
     classify each thread once (per-conversation dedup), apply verdict to
@@ -320,13 +321,19 @@ def reclassify_all(
     None = unlimited (walks the entire history). When set, the desc walker
     stops as soon as the page cursor steps before now() - days_back.
 
+    `progress`: optional dict the worker mutates so the web UI can render
+    live counts (current_folder, threads_classified, errors, folders_walked,
+    folders_total, cursor_received_at). Pass {} to enable live tracking.
+
     Designed to be called from a Flask background thread (see web.py).
-    Returns a summary dict for logs / UI feedback.
+    Returns a summary dict (same shape as the final progress snapshot).
     """
     store = store or Store()
     llm = llm or LLMConfig.from_env()
     mb = store.get_mailbox(mailbox_email)
     if not mb:
+        if progress is not None:
+            progress["error"] = f"unknown mailbox {mailbox_email!r}"
         return {"ok": False, "error": f"unknown mailbox {mailbox_email!r}"}
 
     from datetime import timedelta
@@ -347,7 +354,16 @@ def reclassify_all(
     folders_to_walk = ["INBOX", *LEGACY_RULE_FOLDERS]
     page = 100
     seen: set[str] = set()
-    counts = {"folders_walked": 0, "threads_classified": 0, "errors": 0}
+    counts = {
+        "folders_walked": 0,
+        "folders_total": len(folders_to_walk),
+        "threads_classified": 0,
+        "errors": 0,
+        "current_folder": None,
+        "cursor_received_at": None,
+    }
+    if progress is not None:
+        progress.update(counts)
 
     # Snapshot "now" and advance the watermark up front so the forward
     # poller stops chewing through old INBOX mail behind us. Anything that
@@ -367,6 +383,10 @@ def reclassify_all(
             log.info("[reclassify] stop signal — abort mid-folder %s", folder)
             break
         counts["folders_walked"] += 1
+        counts["current_folder"] = folder
+        if progress is not None:
+            progress["folders_walked"] = counts["folders_walked"]
+            progress["current_folder"] = folder
         # Walk NEWEST → OLDEST so the dashboard fills up with recognizable
         # recent threads first; cursor tracks the OLDEST received_at seen
         # so the next page asks for messages strictly older than that.
@@ -411,6 +431,11 @@ def reclassify_all(
                     counts["errors"] += 1
                 if m.received_at and (cursor is None or m.received_at < cursor):
                     cursor = m.received_at
+                # Mirror live state out to the web UI's progress dict.
+                if progress is not None:
+                    progress["threads_classified"] = counts["threads_classified"]
+                    progress["errors"] = counts["errors"]
+                    progress["cursor_received_at"] = cursor.isoformat() if cursor else None
             if hit_stop or len(batch) < page:
                 break
         log.info("[reclassify] folder %s done (threads=%d errors=%d)",
@@ -420,6 +445,9 @@ def reclassify_all(
     # reclassify run is strictly newer than that and gets picked up by the
     # next forward poll cycle, so nothing falls through the crack.
 
+    counts["current_folder"] = None
+    if progress is not None:
+        progress.update(counts)
     log.info("[reclassify] %s complete: %s", mb.mailbox, counts)
     counts["ok"] = True
     return counts

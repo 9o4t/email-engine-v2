@@ -233,32 +233,38 @@ def mailboxes_reclassify(email: str):
         cur = _reclassify_state.get(email)
         if cur and cur.get("running"):
             return Response(status=303, headers={"Location": "/mailboxes?msg=already-running"})
-        _reclassify_state[email] = {
-            "running": True, "started_at": _now_iso(),
-            "days_back": days_back, "summary": None, "error": None,
+        # `progress` is mutated live by reclassify_all; the /status endpoint
+        # reads from the same state dict so the dashboard sees counts
+        # increment in real time rather than only at the end.
+        state = {
+            "running": True,
+            "started_at": _now_iso(),
+            "finished_at": None,
+            "days_back": days_back,
+            "progress": {
+                "folders_walked": 0,
+                "folders_total": 0,
+                "threads_classified": 0,
+                "errors": 0,
+                "current_folder": None,
+                "cursor_received_at": None,
+            },
+            "error": None,
         }
+        _reclassify_state[email] = state
 
     def _worker():
         try:
-            summary = reclassify_all(email, days_back=days_back)
+            reclassify_all(email, days_back=days_back, progress=state["progress"])
             with _reclassify_lock:
-                _reclassify_state[email] = {
-                    "running": False,
-                    "started_at": _reclassify_state[email].get("started_at"),
-                    "finished_at": _now_iso(),
-                    "days_back": days_back,
-                    "summary": summary, "error": None,
-                }
+                state["running"] = False
+                state["finished_at"] = _now_iso()
         except Exception as e:
             log.exception("reclassify worker failed: %s", e)
             with _reclassify_lock:
-                _reclassify_state[email] = {
-                    "running": False,
-                    "started_at": _reclassify_state[email].get("started_at"),
-                    "finished_at": _now_iso(),
-                    "days_back": days_back,
-                    "summary": None, "error": str(e),
-                }
+                state["running"] = False
+                state["finished_at"] = _now_iso()
+                state["error"] = str(e)
 
     threading.Thread(target=_worker, daemon=True, name=f"reclassify-{email}").start()
     return Response(status=303, headers={"Location": "/mailboxes?msg=reclassify-started"})
@@ -309,6 +315,11 @@ _DARK_MODE_CSS = """\
 <style>
 @media (prefers-color-scheme: dark) {
   body { background: #15171b !important; color: #e6e6e9 !important; }
+  .reclass-card { background: #1c1f26 !important; border-color: #2c2f36 !important; }
+  .reclass-card table.metrics th { color: #b5b7be !important; }
+  .reclass-card table.metrics th,
+  .reclass-card table.metrics td { border-bottom-color: #2c2f36 !important; }
+  .reclass-card .progbar { background: #2c2f36 !important; }
   a { color: #8eb1ff !important; }
   a:visited { color: #b89aff !important; }
   table th { background: #1f2228 !important; color: #d8d8dc !important; }
@@ -431,6 +442,25 @@ _MAILBOXES_HTML = """\
   .banner.ok { background: #e8f8ee; border-color: #1a9b4a; }
   .reclass { font-size: 0.8rem; background: #f0f4ff; border: 1px solid #b9c5ec; }
   .reclass-status { font-size: 0.8rem; color: #555; margin-top: 4px; }
+  .reclass-card { display: none; margin-top: 8px; padding: 8px 12px; border: 1px solid #d6d6dc;
+                  border-radius: 6px; background: #fbfbfd; max-width: 540px; font-size: 0.85rem; }
+  .reclass-card.show { display: block; }
+  .reclass-card table.metrics { border-collapse: collapse; width: 100%; margin: 6px 0 0; }
+  .reclass-card table.metrics th, .reclass-card table.metrics td {
+      padding: 3px 8px; border-bottom: 1px solid #ececf0; text-align: left; vertical-align: top;
+      font-size: 0.85rem;
+  }
+  .reclass-card table.metrics th { font-weight: 600; color: #444; width: 40%; background: transparent; }
+  .reclass-card .dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%;
+                       margin-right: 6px; vertical-align: middle; }
+  .reclass-card .dot.running { background: #1aa8ff; animation: pulse 1.1s ease-in-out infinite; }
+  .reclass-card .dot.done    { background: #2bb24c; }
+  .reclass-card .dot.err     { background: #d84545; }
+  @keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: 0.35; } }
+  .reclass-card .progbar { height: 4px; background: #ececf0; border-radius: 2px;
+                            overflow: hidden; margin-top: 6px; }
+  .reclass-card .progbar > span { display: block; height: 100%; background: #1aa8ff;
+                                  transition: width 250ms ease; }
 </style>
 """ + _DARK_MODE_CSS + _NAV + """\
 {% if request.args.get('msg') == 'reclassify-started' %}
@@ -506,7 +536,20 @@ _MAILBOXES_HTML = """\
           <button type="submit" style="font-size:0.75rem;color:#a00">delete</button>
         </form>
         <span class="help">{{ m.notes }}</span>
-        <div class="reclass-status" id="status-{{ m.mailbox }}"></div>
+        <div class="reclass-card" id="card-{{ m.mailbox }}">
+          <div><span class="dot" id="dot-{{ m.mailbox }}"></span><strong id="state-{{ m.mailbox }}">—</strong>
+               <span class="help" style="margin-left:8px" id="scope-{{ m.mailbox }}"></span></div>
+          <div class="progbar" id="progwrap-{{ m.mailbox }}" style="display:none"><span id="prog-{{ m.mailbox }}"></span></div>
+          <table class="metrics">
+            <tr><th>Started</th>          <td id="m-started-{{ m.mailbox }}">—</td></tr>
+            <tr><th>Finished / elapsed</th><td id="m-finished-{{ m.mailbox }}">—</td></tr>
+            <tr><th>Threads classified</th><td id="m-threads-{{ m.mailbox }}">0</td></tr>
+            <tr><th>Errors</th>            <td id="m-errors-{{ m.mailbox }}">0</td></tr>
+            <tr><th>Folders walked</th>    <td id="m-folders-{{ m.mailbox }}">0 / 0</td></tr>
+            <tr><th>Current folder</th>    <td id="m-cur-{{ m.mailbox }}">—</td></tr>
+            <tr><th>Walk cursor</th>       <td id="m-cursor-{{ m.mailbox }}">—</td></tr>
+          </table>
+        </div>
       </td>
     </tr>
   {% endfor %}
@@ -543,30 +586,97 @@ For <strong>imap</strong>: set <code>IMAP_&lt;SANITIZED_EMAIL&gt;_PASSWORD</code
 </div>
 
 <script>
-// Poll reclassify status every 4s for each mailbox row.
+// Live reclassify metrics table. Polls every 2s while a job runs,
+// every 8s otherwise.
 (function () {
   const mailboxes = {{ mailboxes | map(attribute='mailbox') | list | tojson }};
-  function fmt(s) {
-    if (!s) return '';
-    const scope = s.days_back ? `last ${s.days_back}d` : 'all history';
-    if (s.running) return `… reclassifying (${scope}, started ${s.started_at?.slice(11,19) || ''}Z)`;
-    if (s.error)   return `✗ last reclassify (${scope}) error: ${s.error}`;
-    if (s.summary) return `✓ last reclassify (${scope}): ${s.summary.threads_classified || 0} thread(s), ${s.summary.errors || 0} error(s) across ${s.summary.folders_walked || 0} folder(s)`;
-    return '';
+
+  function fmtDuration(ms) {
+    if (ms < 1000) return `${ms} ms`;
+    const s = Math.floor(ms / 1000);
+    if (s < 60) return `${s}s`;
+    const m = Math.floor(s / 60), rs = s % 60;
+    return `${m}m ${rs}s`;
   }
+  function fmtUtc(iso) {
+    if (!iso) return '—';
+    return iso.slice(0, 19).replace('T', ' ') + ' UTC';
+  }
+  function set(id, txt) { const el = document.getElementById(id); if (el) el.textContent = txt; }
+
+  function render(mb, s) {
+    const card = document.getElementById(`card-${mb}`);
+    if (!s || (!s.running && !s.progress && !s.error)) {
+      if (card) card.classList.remove('show');
+      return;
+    }
+    if (card) card.classList.add('show');
+
+    const dot = document.getElementById(`dot-${mb}`);
+    const state = document.getElementById(`state-${mb}`);
+    if (s.running) {
+      dot.className = 'dot running';
+      state.textContent = 'Running…';
+    } else if (s.error) {
+      dot.className = 'dot err';
+      state.textContent = 'Error';
+    } else {
+      dot.className = 'dot done';
+      state.textContent = 'Complete';
+    }
+
+    const scope = s.days_back ? `scope: last ${s.days_back} day(s)` : 'scope: all history';
+    set(`scope-${mb}`, scope);
+    set(`m-started-${mb}`, fmtUtc(s.started_at));
+
+    // Finished / elapsed cell shows finish time when done, live duration when running.
+    if (s.running && s.started_at) {
+      const dur = Date.now() - Date.parse(s.started_at);
+      set(`m-finished-${mb}`, `running — ${fmtDuration(dur)}`);
+    } else if (s.finished_at && s.started_at) {
+      const dur = Date.parse(s.finished_at) - Date.parse(s.started_at);
+      set(`m-finished-${mb}`, `${fmtUtc(s.finished_at)} (${fmtDuration(dur)})`);
+    } else {
+      set(`m-finished-${mb}`, '—');
+    }
+
+    const p = s.progress || {};
+    set(`m-threads-${mb}`, String(p.threads_classified ?? 0));
+    set(`m-errors-${mb}`,  String(p.errors ?? 0));
+    set(`m-folders-${mb}`, `${p.folders_walked ?? 0} / ${p.folders_total ?? 0}`);
+    set(`m-cur-${mb}`,     p.current_folder || (s.running ? 'starting…' : '—'));
+    set(`m-cursor-${mb}`,  p.cursor_received_at ? fmtUtc(p.cursor_received_at) : '—');
+
+    if (s.error) {
+      set(`m-cur-${mb}`, s.error);
+    }
+
+    const progwrap = document.getElementById(`progwrap-${mb}`);
+    const prog = document.getElementById(`prog-${mb}`);
+    if (p.folders_total && p.folders_total > 0 && s.running) {
+      progwrap.style.display = 'block';
+      prog.style.width = `${Math.min(100, (p.folders_walked / p.folders_total) * 100).toFixed(1)}%`;
+    } else {
+      progwrap.style.display = 'none';
+    }
+  }
+
+  let pollMs = 8000;
   async function tick() {
+    let anyRunning = false;
     for (const mb of mailboxes) {
       try {
         const r = await fetch(`/api/reclassify/${encodeURIComponent(mb)}/status`);
         if (!r.ok) continue;
         const j = await r.json();
-        const el = document.getElementById(`status-${mb}`);
-        if (el) el.textContent = fmt(j);
+        render(mb, j);
+        if (j && j.running) anyRunning = true;
       } catch (_) {}
     }
+    pollMs = anyRunning ? 2000 : 8000;
+    setTimeout(tick, pollMs);
   }
   tick();
-  setInterval(tick, 4000);
 })();
 </script>
 """
