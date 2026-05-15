@@ -5,6 +5,12 @@ ENV PYTHONUNBUFFERED=1 \
     PIP_NO_CACHE_DIR=1 \
     PIP_DISABLE_PIP_VERSION_CHECK=1
 
+# sqlite3 CLI for interactive DB inspection via `railway ssh -- sqlite3 /data/...`.
+# less + vim-tiny for general triage during ssh sessions. Tiny — adds < 5 MB.
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends sqlite3 less vim-tiny ca-certificates \
+ && rm -rf /var/lib/apt/lists/*
+
 WORKDIR /app
 
 COPY requirements.txt /app/
