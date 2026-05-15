@@ -202,7 +202,14 @@ def _classify_thread_and_apply(
         if tm.id != latest_msg.id
     ]
 
-    # 3. Classify based on the latest message + thread context.
+    # 3a. Capture the PREVIOUS verdict for this thread BEFORE we touch
+    # anything, so the history row records prev → new transitions
+    # (and the /changes view can surface them).
+    prev_verdict = None
+    if trigger.conversation_id:
+        prev_verdict = store.get_latest_thread_verdict(mb.mailbox, trigger.conversation_id)
+
+    # 3b. Classify based on the latest message + thread context.
     verdict = classify(
         mailbox=mb.mailbox,
         sender=latest_msg.from_address or latest_msg.from_name,
@@ -212,6 +219,29 @@ def _classify_thread_and_apply(
         cfg=llm,
     )
     folder_name = verdict.folder
+
+    # 3c. Append a thread_verdicts row — append-only history, never
+    # deleted. This is how the /threads + /changes tabs work.
+    # Reason: best-effort first line of the LLM reply (we strip it down
+    # because Haystack already trimmed to the leaf id, but if the model
+    # is chattier we keep a sentence of context).
+    reason_short = (verdict.raw or "").strip().splitlines()[0][:240] if verdict.raw else None
+    if trigger.conversation_id:
+        try:
+            store.record_thread_verdict(
+                mailbox=mb.mailbox,
+                conversation_id=trigger.conversation_id,
+                verdict_folder=folder_name,
+                prev_verdict=prev_verdict,
+                reason=reason_short,
+                model_raw=verdict.raw,
+                trigger_message_id=latest_msg.id,
+                trigger_subject=latest_msg.subject,
+                trigger_sender=latest_msg.from_address or latest_msg.from_name,
+                thread_size=len(thread),
+            )
+        except Exception as e:
+            log.exception("[%s] thread_verdicts insert failed: %s", mb.mailbox, e)
 
     # 4. Wipe stale decisions for this thread before re-inserting — matches
     # v1's DeleteDecisionsForThread step, so the dashboard never shows two

@@ -86,6 +86,28 @@ CREATE TABLE IF NOT EXISTS jobs (
     updated_at  TEXT NOT NULL,
     PRIMARY KEY (mailbox, job_type)
 );
+
+-- One row per CLASSIFICATION of a thread. Append-only, never deleted.
+-- Lets us answer "what was the verdict for this thread at any past
+-- moment?" — including capturing the case where a colleague replies and
+-- the thread demotes from 1-Critical → 4-Medium, with the timestamp +
+-- the LLM's reason for the change.
+CREATE TABLE IF NOT EXISTS thread_verdicts (
+    id                  TEXT PRIMARY KEY,
+    mailbox             TEXT NOT NULL,
+    conversation_id     TEXT NOT NULL,
+    decided_at          TEXT NOT NULL,
+    verdict_folder      TEXT NOT NULL,
+    prev_verdict        TEXT,                       -- NULL on first classification
+    reason              TEXT,                       -- LLM "reason" field if structured, else first line of raw
+    model_raw           TEXT,                       -- full LLM reply for debugging
+    trigger_message_id  TEXT,
+    trigger_subject     TEXT,
+    trigger_sender      TEXT,
+    thread_size         INTEGER NOT NULL DEFAULT 0  -- # messages in thread at decision time
+);
+CREATE INDEX IF NOT EXISTS idx_tv_conv ON thread_verdicts(mailbox, conversation_id, decided_at DESC);
+CREATE INDEX IF NOT EXISTS idx_tv_decided ON thread_verdicts(mailbox, decided_at DESC);
 """
 
 
@@ -334,6 +356,118 @@ class Store:
             return _json.loads(row["state_json"])
         except Exception:
             return None
+
+    # --- thread_verdicts (append-only history) -----------------------------
+
+    def get_latest_thread_verdict(self, mailbox: str, conversation_id: str) -> str | None:
+        """Return the most recent verdict_folder this mailbox had for the
+        thread, or None if it's never been classified. Used by the poller
+        to fill `prev_verdict` on the next thread_verdicts row."""
+        if not conversation_id:
+            return None
+        with self._conn() as c:
+            row = c.execute(
+                """SELECT verdict_folder FROM thread_verdicts
+                   WHERE mailbox = ? AND conversation_id = ?
+                   ORDER BY decided_at DESC LIMIT 1""",
+                (mailbox, conversation_id),
+            ).fetchone()
+        return row["verdict_folder"] if row else None
+
+    def record_thread_verdict(
+        self, *,
+        mailbox: str,
+        conversation_id: str,
+        verdict_folder: str,
+        prev_verdict: str | None,
+        reason: str | None,
+        model_raw: str | None,
+        trigger_message_id: str | None,
+        trigger_subject: str | None,
+        trigger_sender: str | None,
+        thread_size: int,
+    ) -> str:
+        tvid = str(uuid.uuid4())
+        now = datetime.now(timezone.utc).isoformat()
+        with self._conn() as c:
+            c.execute(
+                """INSERT INTO thread_verdicts
+                   (id, mailbox, conversation_id, decided_at, verdict_folder,
+                    prev_verdict, reason, model_raw, trigger_message_id,
+                    trigger_subject, trigger_sender, thread_size)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (tvid, mailbox, conversation_id, now, verdict_folder,
+                 prev_verdict, reason, model_raw, trigger_message_id,
+                 trigger_subject, trigger_sender, thread_size),
+            )
+        return tvid
+
+    def list_threads(self, mailbox: str | None = None, limit: int = 200) -> list[dict]:
+        """One row per conversation_id: latest verdict, subject, sender,
+        message count, last activity. Drives the /threads tab."""
+        sql = """
+            SELECT
+              d.conversation_id                                    AS conversation_id,
+              d.mailbox                                            AS mailbox,
+              MAX(d.created_at)                                    AS last_activity,
+              COUNT(*)                                             AS msg_count,
+              (SELECT verdict_folder FROM decisions
+                 WHERE conversation_id = d.conversation_id AND mailbox = d.mailbox
+                 ORDER BY created_at DESC LIMIT 1)                 AS latest_verdict,
+              (SELECT subject FROM decisions
+                 WHERE conversation_id = d.conversation_id AND mailbox = d.mailbox
+                 ORDER BY created_at DESC LIMIT 1)                 AS subject,
+              (SELECT sender FROM decisions
+                 WHERE conversation_id = d.conversation_id AND mailbox = d.mailbox
+                 ORDER BY created_at DESC LIMIT 1)                 AS latest_sender,
+              (SELECT COUNT(*) FROM thread_verdicts
+                 WHERE conversation_id = d.conversation_id AND mailbox = d.mailbox) AS verdict_count
+            FROM decisions d
+            WHERE d.conversation_id IS NOT NULL AND d.conversation_id != ''
+        """
+        args: list = []
+        if mailbox:
+            sql += " AND d.mailbox = ?"
+            args.append(mailbox)
+        sql += " GROUP BY d.mailbox, d.conversation_id ORDER BY last_activity DESC LIMIT ?"
+        args.append(limit)
+        with self._conn() as c:
+            rows = c.execute(sql, args).fetchall()
+        return [dict(r) for r in rows]
+
+    def list_thread_changes(
+        self, mailbox: str | None = None,
+        only_changes: bool = True,
+        limit: int = 200,
+    ) -> list[dict]:
+        """Rows from thread_verdicts. With only_changes=True (default),
+        filter to where prev_verdict != verdict_folder (and is non-null) —
+        the actual verdict CHANGES. With only_changes=False, every recorded
+        classification (useful for full audit)."""
+        sql = "SELECT * FROM thread_verdicts WHERE 1=1"
+        args: list = []
+        if mailbox:
+            sql += " AND mailbox = ?"
+            args.append(mailbox)
+        if only_changes:
+            sql += " AND prev_verdict IS NOT NULL AND prev_verdict != verdict_folder"
+        sql += " ORDER BY decided_at DESC LIMIT ?"
+        args.append(limit)
+        with self._conn() as c:
+            rows = c.execute(sql, args).fetchall()
+        return [dict(r) for r in rows]
+
+    def thread_verdict_history(self, mailbox: str, conversation_id: str) -> list[dict]:
+        """Full timeline of verdicts for one thread, oldest first.
+        Used by the per-thread drill-down."""
+        with self._conn() as c:
+            rows = c.execute(
+                """SELECT * FROM thread_verdicts
+                   WHERE mailbox = ? AND conversation_id = ?
+                   ORDER BY decided_at ASC""",
+                (mailbox, conversation_id),
+            ).fetchall()
+        return [dict(r) for r in rows]
 
     def feedback_export(self, mailbox: str | None = None) -> list[dict]:
         sql = """

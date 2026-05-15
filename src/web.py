@@ -24,11 +24,16 @@ import io
 import json
 import logging
 import os
+import sqlite3
+import tempfile
 import threading
+from datetime import datetime, timezone
 from functools import wraps
+from pathlib import Path
 
 from dotenv import load_dotenv
-from flask import Flask, Response, abort, jsonify, render_template_string, request
+from flask import (Flask, Response, abort, after_this_request, jsonify,
+                   render_template_string, request, send_file)
 
 from classifier import hierarchy_path_for, invalidate_cache, list_folders
 from lib.apply import APPLY_MODES
@@ -134,6 +139,149 @@ def feedback_csv():
         w.writerows(rows)
     return Response(buf.getvalue(), mimetype="text/csv",
                     headers={"Content-Disposition": 'attachment; filename="feedback.csv"'})
+
+
+@app.get("/api/decisions.csv")
+@_require_auth
+def decisions_csv():
+    """Full decisions dump as CSV. Streams from the DB in pages of 1000
+    so a million-row table doesn't blow up memory."""
+    mailbox = request.args.get("mailbox") or None
+    cols = ("id", "created_at", "mailbox", "provider", "message_id",
+            "internet_message_id", "conversation_id", "sender", "subject",
+            "body_preview", "src_folder", "verdict_folder", "retrieved",
+            "llm_raw", "apply_mode", "tagged", "moved", "apply_error")
+
+    def gen():
+        buf = io.StringIO()
+        w = csv.writer(buf)
+        w.writerow(cols)
+        yield buf.getvalue(); buf.seek(0); buf.truncate(0)
+        page = 1000
+        offset = 0
+        while True:
+            sql = "SELECT " + ",".join(cols) + " FROM decisions"
+            args: list = []
+            if mailbox:
+                sql += " WHERE mailbox = ?"
+                args.append(mailbox)
+            sql += " ORDER BY created_at ASC LIMIT ? OFFSET ?"
+            args.extend([page, offset])
+            with store._conn() as c:
+                rows = c.execute(sql, args).fetchall()
+            if not rows:
+                break
+            for r in rows:
+                w.writerow([r[k] for k in cols])
+            yield buf.getvalue(); buf.seek(0); buf.truncate(0)
+            offset += len(rows)
+            if len(rows) < page:
+                break
+    fname = f"decisions-{datetime.now(timezone.utc).strftime('%Y%m%d-%H%M')}.csv"
+    return Response(gen(), mimetype="text/csv",
+                    headers={"Content-Disposition": f'attachment; filename="{fname}"'})
+
+
+# --- Threads tab (consolidated by conversation) -----------------------------
+
+@app.get("/threads")
+@_require_auth
+def threads_view():
+    mailbox = request.args.get("mailbox") or None
+    limit = int(request.args.get("limit", "200"))
+    rows = store.list_threads(mailbox=mailbox, limit=limit)
+    return render_template_string(
+        _THREADS_HTML,
+        rows=rows,
+        mailboxes=[m.mailbox for m in store.list_mailboxes()],
+        current_mailbox=mailbox or "",
+        limit=limit,
+    )
+
+
+@app.get("/threads/<path:conversation_id>")
+@_require_auth
+def thread_detail(conversation_id: str):
+    """Full timeline for one thread: every verdict row over time."""
+    mailbox = request.args.get("mailbox") or None
+    # If mailbox isn't supplied, look it up from the most recent decision row.
+    if not mailbox:
+        rows = store.recent_decisions(limit=1000)
+        for d in rows:
+            if d.conversation_id == conversation_id:
+                mailbox = d.mailbox
+                break
+    if not mailbox:
+        abort(404, "no decision rows found for that conversation_id")
+    history = store.thread_verdict_history(mailbox, conversation_id)
+    # Also pull the per-message decisions so the user can see WHAT moved.
+    with store._conn() as c:
+        decisions = [dict(r) for r in c.execute(
+            """SELECT created_at, sender, subject, verdict_folder, tagged, moved,
+                      apply_error, body_preview
+               FROM decisions WHERE mailbox = ? AND conversation_id = ?
+               ORDER BY created_at ASC""", (mailbox, conversation_id)).fetchall()]
+    return render_template_string(
+        _THREAD_DETAIL_HTML,
+        mailbox=mailbox,
+        conversation_id=conversation_id,
+        history=history,
+        decisions=decisions,
+    )
+
+
+# --- Changes tab (thread verdict transitions) -------------------------------
+
+@app.get("/changes")
+@_require_auth
+def changes_view():
+    mailbox = request.args.get("mailbox") or None
+    only_changes = request.args.get("changes_only", "1") == "1"
+    limit = int(request.args.get("limit", "200"))
+    rows = store.list_thread_changes(mailbox=mailbox, only_changes=only_changes, limit=limit)
+    return render_template_string(
+        _CHANGES_HTML,
+        rows=rows,
+        mailboxes=[m.mailbox for m in store.list_mailboxes()],
+        current_mailbox=mailbox or "",
+        only_changes=only_changes,
+        limit=limit,
+    )
+
+
+# --- DB download (consistent snapshot via sqlite3.backup) -------------------
+
+@app.get("/admin/db.sqlite")
+@_require_auth
+def download_db():
+    """Stream a consistent snapshot of the live SQLite DB.
+
+    Uses sqlite3's online backup API rather than copying the file
+    directly — that way the user gets a clean DB even if a write is
+    in flight at request time. Snapshot is staged to a temp file and
+    cleaned up after the response is sent."""
+    tmp_dir = Path(tempfile.mkdtemp(prefix="db-dl-"))
+    snap = tmp_dir / "email-engine-v2.db"
+    src = sqlite3.connect(str(store.path))
+    dst = sqlite3.connect(str(snap))
+    try:
+        src.backup(dst)
+    finally:
+        src.close()
+        dst.close()
+
+    @after_this_request
+    def _cleanup(response):
+        try:
+            snap.unlink(missing_ok=True)
+            tmp_dir.rmdir()
+        except Exception:
+            log.exception("temp snapshot cleanup failed")
+        return response
+
+    fname = f"email-engine-v2-{datetime.now(timezone.utc).strftime('%Y%m%d-%H%M%S')}.db"
+    return send_file(str(snap), as_attachment=True, download_name=fname,
+                     mimetype="application/x-sqlite3")
 
 
 @app.get("/api/decisions.json")
@@ -401,8 +549,12 @@ def hierarchy_view(email: str):
 _NAV = """\
 <nav style="margin: 0 0 1rem; font-size: 0.9rem;">
   <a href="/">Decisions</a> ·
+  <a href="/threads">Threads</a> ·
+  <a href="/changes">Changes</a> ·
   <a href="/mailboxes">Mailboxes</a> ·
-  <a href="/api/feedback.csv">Feedback CSV</a>
+  <a href="/admin/db.sqlite">Download DB</a> ·
+  <a href="/api/feedback.csv">Feedback CSV</a> ·
+  <a href="/api/decisions.csv">Decisions CSV</a>
 </nav>
 """
 
@@ -831,6 +983,209 @@ _HIERARCHY_HTML = """\
 <p class="path">Source: <code>{{ path }}</code></p>
 <p>Edit this file in your fork's <code>src/data/hierarchies/</code> and push to update. Cache invalidates on every feedback submission, so no restart needed once the file lands in the container.</p>
 <pre>{{ data | tojson(indent=2) }}</pre>
+"""
+
+
+_THREADS_HTML = """\
+<!doctype html><title>email-engine-v2 — threads</title>
+<style>
+  body { font: 14px/1.4 -apple-system, system-ui, sans-serif; margin: 1.5rem; }
+  h1 { font-size: 1.2rem; margin: 0 0 1rem; }
+  table { border-collapse: collapse; width: 100%; }
+  th, td { padding: 6px 8px; border-bottom: 1px solid #eee; vertical-align: top; }
+  th { text-align: left; background: #fafafa; }
+  .verdict { font-family: ui-monospace, monospace; font-size: 0.85rem;
+             padding: 2px 6px; border-radius: 4px; background: #eef; }
+  .when { color: #777; font-size: 0.8rem; white-space: nowrap; }
+  .subj { font-weight: 600; }
+  .sender, .help { color: #555; font-size: 0.85rem; }
+  .chip { display: inline-block; font-size: 0.7rem; padding: 1px 5px;
+          border-radius: 8px; background: #fff3d4; color: #6b4d00; margin-left: 4px; }
+  a.tlink { color: inherit; text-decoration: none; }
+  a.tlink:hover { text-decoration: underline; }
+</style>
+""" + _DARK_MODE_CSS + _NAV + """\
+<h1>Threads {% if current_mailbox %}— {{ current_mailbox }}{% endif %}</h1>
+
+<form method="get" style="margin-bottom: 1rem;">
+  <label>Mailbox:
+    <select name="mailbox" onchange="this.form.submit()">
+      <option value="">(all)</option>
+      {% for m in mailboxes %}<option value="{{ m }}" {% if m == current_mailbox %}selected{% endif %}>{{ m }}</option>{% endfor %}
+    </select>
+  </label>
+  <label>Show:
+    <select name="limit" onchange="this.form.submit()">
+      {% for n in [100, 200, 500, 1000] %}<option value="{{ n }}" {% if n == limit %}selected{% endif %}>{{ n }}</option>{% endfor %}
+    </select>
+  </label>
+  <span class="help">{{ rows|length }} thread(s) shown</span>
+</form>
+
+<table>
+  <thead><tr>
+    <th>Last activity</th><th>Mailbox</th><th>Thread (latest)</th>
+    <th>Current verdict</th><th># msgs</th><th>Verdict history</th>
+  </tr></thead>
+  <tbody>
+    {% for r in rows %}
+    <tr>
+      <td class="when">{{ r.last_activity[:19].replace('T',' ') if r.last_activity else '' }}</td>
+      <td>{{ r.mailbox }}</td>
+      <td>
+        <div class="subj">
+          <a class="tlink" href="/threads/{{ r.conversation_id }}?mailbox={{ r.mailbox }}">{{ r.subject or '(no subject)' }}</a>
+        </div>
+        <div class="sender">{{ r.latest_sender or '' }}</div>
+      </td>
+      <td><span class="verdict">{{ r.latest_verdict }}</span></td>
+      <td>{{ r.msg_count }}</td>
+      <td>
+        {{ r.verdict_count or 0 }} verdict(s)
+        {% if r.verdict_count and r.verdict_count > 1 %}<span class="chip">changed</span>{% endif %}
+      </td>
+    </tr>
+    {% endfor %}
+  </tbody>
+</table>
+"""
+
+
+_THREAD_DETAIL_HTML = """\
+<!doctype html><title>thread {{ conversation_id[:12] }} — email-engine-v2</title>
+<style>
+  body { font: 14px/1.4 -apple-system, system-ui, sans-serif; margin: 1.5rem; max-width: 1100px; }
+  h1, h2 { font-size: 1.1rem; }
+  table { border-collapse: collapse; width: 100%; margin-bottom: 1.5rem; }
+  th, td { padding: 6px 8px; border-bottom: 1px solid #eee; vertical-align: top; }
+  th { text-align: left; background: #fafafa; }
+  .verdict { font-family: ui-monospace, monospace; font-size: 0.85rem;
+             padding: 2px 6px; border-radius: 4px; background: #eef; }
+  .arrow { color: #888; }
+  .when { color: #777; font-size: 0.8rem; white-space: nowrap; }
+  .reason { color: #555; font-style: italic; font-size: 0.85rem;
+            white-space: pre-wrap; word-break: break-word; }
+  .err { color: #b00; font-size: 0.85rem; }
+  code { background: #f0f0f4; padding: 1px 4px; border-radius: 3px; font-size: 0.8rem; }
+  .changed { background: #fff8db; }
+</style>
+""" + _DARK_MODE_CSS + _NAV + """\
+<h2>Thread <code>{{ conversation_id[:24] }}…</code></h2>
+<p class="help" style="color: #666; font-size: 0.85rem; margin-top: -8px;">Mailbox: {{ mailbox }}</p>
+
+<h2>Verdict timeline ({{ history|length }} classification(s))</h2>
+<table>
+  <thead><tr><th>When (UTC)</th><th>Verdict</th><th>Trigger subject</th><th>Trigger sender</th><th>Thread size</th><th>Reason</th></tr></thead>
+  <tbody>
+    {% for h in history %}
+    <tr {% if h.prev_verdict and h.prev_verdict != h.verdict_folder %}class="changed"{% endif %}>
+      <td class="when">{{ h.decided_at[:19].replace('T',' ') }}</td>
+      <td>
+        {% if h.prev_verdict and h.prev_verdict != h.verdict_folder %}
+          <span class="verdict">{{ h.prev_verdict }}</span> <span class="arrow">→</span>
+        {% endif %}
+        <span class="verdict">{{ h.verdict_folder }}</span>
+      </td>
+      <td>{{ (h.trigger_subject or '')[:80] }}</td>
+      <td>{{ h.trigger_sender or '' }}</td>
+      <td>{{ h.thread_size }}</td>
+      <td class="reason">{{ (h.reason or h.model_raw or '')[:300] }}</td>
+    </tr>
+    {% endfor %}
+  </tbody>
+</table>
+
+<h2>Messages in this thread ({{ decisions|length }})</h2>
+<table>
+  <thead><tr><th>When (UTC)</th><th>Sender</th><th>Subject</th><th>Verdict folder</th><th>Tag</th><th>Move</th><th>Apply error</th></tr></thead>
+  <tbody>
+    {% for d in decisions %}
+    <tr>
+      <td class="when">{{ d.created_at[:19].replace('T',' ') }}</td>
+      <td>{{ d.sender }}</td>
+      <td>{{ (d.subject or '(no subject)')[:80] }}</td>
+      <td><span class="verdict">{{ d.verdict_folder }}</span></td>
+      <td>{% if d.tagged %}✓{% else %}—{% endif %}</td>
+      <td>{% if d.moved %}✓{% else %}—{% endif %}</td>
+      <td class="err">{{ d.apply_error or '' }}</td>
+    </tr>
+    {% endfor %}
+  </tbody>
+</table>
+"""
+
+
+_CHANGES_HTML = """\
+<!doctype html><title>email-engine-v2 — verdict changes</title>
+<style>
+  body { font: 14px/1.4 -apple-system, system-ui, sans-serif; margin: 1.5rem; }
+  h1 { font-size: 1.2rem; margin: 0 0 1rem; }
+  table { border-collapse: collapse; width: 100%; }
+  th, td { padding: 6px 8px; border-bottom: 1px solid #eee; vertical-align: top; }
+  th { text-align: left; background: #fafafa; }
+  .verdict { font-family: ui-monospace, monospace; font-size: 0.85rem;
+             padding: 2px 6px; border-radius: 4px; background: #eef; }
+  .arrow { color: #888; font-weight: 700; }
+  .when { color: #777; font-size: 0.8rem; white-space: nowrap; }
+  .subj { font-weight: 600; }
+  .sender, .help { color: #555; font-size: 0.85rem; }
+  .reason { color: #555; font-style: italic; font-size: 0.85rem;
+            max-width: 420px; white-space: pre-wrap; word-break: break-word; }
+  a.tlink { color: inherit; text-decoration: none; }
+  a.tlink:hover { text-decoration: underline; }
+</style>
+""" + _DARK_MODE_CSS + _NAV + """\
+<h1>Verdict changes {% if current_mailbox %}— {{ current_mailbox }}{% endif %}</h1>
+
+<form method="get" style="margin-bottom: 1rem;">
+  <label>Mailbox:
+    <select name="mailbox" onchange="this.form.submit()">
+      <option value="">(all)</option>
+      {% for m in mailboxes %}<option value="{{ m }}" {% if m == current_mailbox %}selected{% endif %}>{{ m }}</option>{% endfor %}
+    </select>
+  </label>
+  <label>Filter:
+    <select name="changes_only" onchange="this.form.submit()">
+      <option value="1" {% if only_changes %}selected{% endif %}>only verdict changes</option>
+      <option value="0" {% if not only_changes %}selected{% endif %}>every classification (full audit)</option>
+    </select>
+  </label>
+  <label>Show:
+    <select name="limit" onchange="this.form.submit()">
+      {% for n in [100, 200, 500, 1000] %}<option value="{{ n }}" {% if n == limit %}selected{% endif %}>{{ n }}</option>{% endfor %}
+    </select>
+  </label>
+  <span class="help">{{ rows|length }} row(s)</span>
+</form>
+
+<table>
+  <thead><tr>
+    <th>When (UTC)</th><th>Mailbox</th><th>Thread (trigger)</th>
+    <th>Verdict</th><th>Reason</th>
+  </tr></thead>
+  <tbody>
+    {% for r in rows %}
+    <tr>
+      <td class="when">{{ r.decided_at[:19].replace('T',' ') }}</td>
+      <td>{{ r.mailbox }}</td>
+      <td>
+        <div class="subj">
+          <a class="tlink" href="/threads/{{ r.conversation_id }}?mailbox={{ r.mailbox }}">{{ (r.trigger_subject or '(no subject)')[:80] }}</a>
+        </div>
+        <div class="sender">{{ r.trigger_sender or '' }} · thread size: {{ r.thread_size }}</div>
+      </td>
+      <td>
+        {% if r.prev_verdict %}
+          <span class="verdict">{{ r.prev_verdict }}</span>
+          <span class="arrow">→</span>
+        {% endif %}
+        <span class="verdict">{{ r.verdict_folder }}</span>
+      </td>
+      <td class="reason">{{ r.reason or r.model_raw or '' }}</td>
+    </tr>
+    {% endfor %}
+  </tbody>
+</table>
 """
 
 
