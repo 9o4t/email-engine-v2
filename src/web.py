@@ -278,6 +278,44 @@ _NAV = """\
 </nav>
 """
 
+# Single dark-mode override block prepended to every page. Uses
+# prefers-color-scheme so it follows your OS setting (no manual toggle —
+# add one later if you find yourself flipping between modes a lot).
+# Defined via CSS variables so the existing per-template inline styles
+# can stay as-is; this block just retints body, tables, inputs, links,
+# code, pre, banners, and pills.
+_DARK_MODE_CSS = """\
+<style>
+@media (prefers-color-scheme: dark) {
+  body { background: #15171b !important; color: #e6e6e9 !important; }
+  a { color: #8eb1ff !important; }
+  a:visited { color: #b89aff !important; }
+  table th { background: #1f2228 !important; color: #d8d8dc !important; }
+  table tr:hover { background: #1c1e23 !important; }
+  table td, table th { border-bottom-color: #2c2f36 !important; }
+  input[type=text], input[type=number], select, button,
+  input[type=submit] {
+    background: #1f2228 !important; color: #e6e6e9 !important;
+    border: 1px solid #3a3d45 !important; border-radius: 3px;
+  }
+  input:focus, select:focus { outline: 2px solid #8eb1ff !important; outline-offset: -1px; }
+  code { background: #2a2d34 !important; color: #e6e6e9 !important; }
+  pre  { background: #11131a !important; color: #d8d8dc !important; }
+
+  .verdict      { background: #233055 !important; color: #cbd6ff !important; }
+  .mode         { background: #2a2d34 !important; color: #b0b3bb !important; }
+  .err, .moved-no { color: #ff9d9d !important; }
+  .help, .when, .sender, .reclass-status { color: #98989f !important; }
+  .pill.right   { background: #1c3a23 !important; color: #88e89c !important; border-color: #2e6a3a !important; }
+  .pill.wrong   { background: #4a1f1f !important; color: #ffb0b0 !important; border-color: #7a3a3a !important; }
+  .reclass      { background: #1d2a4d !important; color: #cbd6ff !important; border: 1px solid #3a4c80 !important; }
+  .add          { background: #1c1f26 !important; border: 1px solid #2c2f36; }
+  .banner       { background: #3a2e0e !important; border-left-color: #c08a16 !important; color: #f0e0a6 !important; }
+  .banner.ok    { background: #14331e !important; border-left-color: #2e8a48 !important; color: #b6e8c2 !important; }
+}
+</style>
+"""
+
 _DECISIONS_HTML = """\
 <!doctype html><title>email-engine-v2 — decisions</title>
 <style>
@@ -297,7 +335,7 @@ _DECISIONS_HTML = """\
   .sender { color: #555; font-size: 0.85rem; }
   .when { color: #777; font-size: 0.8rem; white-space: nowrap; }
 </style>
-""" + _NAV + """\
+""" + _DARK_MODE_CSS + _NAV + """\
 <h1>Recent classifications {% if current_mailbox %}— {{ current_mailbox }}{% endif %}</h1>
 
 <form method="get" style="margin-bottom: 1rem;">
@@ -373,7 +411,7 @@ _MAILBOXES_HTML = """\
   .reclass { font-size: 0.8rem; background: #f0f4ff; border: 1px solid #b9c5ec; }
   .reclass-status { font-size: 0.8rem; color: #555; margin-top: 4px; }
 </style>
-""" + _NAV + """\
+""" + _DARK_MODE_CSS + _NAV + """\
 {% if request.args.get('msg') == 'reclassify-started' %}
   <div class="banner ok">Reclassify started — walks INBOX + every legacy <code>…-X</code> folder. Watch <a href="/">decisions</a> or poll <code>/api/reclassify/&lt;email&gt;/status</code>.</div>
 {% elif request.args.get('msg') == 'already-running' %}
@@ -409,8 +447,14 @@ _MAILBOXES_HTML = """\
         </select>
       </td>
       <td>
-        <input type="text" name="imap_server" value="{{ m.imap_server }}" size="20">
-        :<input type="number" name="imap_port" value="{{ m.imap_port }}" size="5" style="width:60px">
+        {% if m.provider == 'imap' %}
+          <input type="text" name="imap_server" value="{{ m.imap_server }}" size="20">
+          :<input type="number" name="imap_port" value="{{ m.imap_port }}" size="5" style="width:60px">
+        {% else %}
+          <span class="help" title="Only used when provider = imap">n/a — Graph mailbox</span>
+          <input type="hidden" name="imap_server" value="{{ m.imap_server }}">
+          <input type="hidden" name="imap_port" value="{{ m.imap_port }}">
+        {% endif %}
       </td>
       <td><input type="number" name="poll_interval" value="{{ m.poll_interval }}" style="width:60px"> s</td>
       <td>
@@ -504,7 +548,7 @@ _HIERARCHY_HTML = """\
   }
   .path { color: #666; font-size: 0.85rem; }
 </style>
-""" + _NAV + """\
+""" + _DARK_MODE_CSS + _NAV + """\
 <h2>{{ mailbox }} — taxonomy</h2>
 <p class="path">Source: <code>{{ path }}</code></p>
 <p>Edit this file in your fork's <code>src/data/hierarchies/</code> and push to update. Cache invalidates on every feedback submission, so no restart needed once the file lands in the container.</p>
