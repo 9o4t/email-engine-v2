@@ -203,13 +203,42 @@ def threads_view():
     mailbox = request.args.get("mailbox") or None
     limit = int(request.args.get("limit", "200"))
     group_by = request.args.get("group", "date")  # 'date' (default) | 'verdict'
+    compact = request.args.get("compact", "0") == "1"
+
     rows = store.list_threads(mailbox=mailbox, limit=limit)
 
-    # Per-verdict counts for the section headers (always computed so we
-    # can show the same info as a summary even when group=date).
+    # Compact view: collapse rows that share BOTH subject AND sender into
+    # a single representative row. Keeps the most-recently-active thread
+    # as the visible row (link target) and accumulates a `collapsed_count`
+    # of how many same-subject same-sender threads it represents.
+    # Templated noise (Teams notifications, marketing blasts, form auto-
+    # replies) folds down to one row each.
+    raw_count = len(rows)
+    if compact:
+        # rows are already sorted last_activity DESC by SQL, so the first
+        # occurrence of any (subject, sender) is the most recent.
+        from collections import OrderedDict
+        bucket: OrderedDict = OrderedDict()
+        for r in rows:
+            key = ((r.get("subject") or "").strip(),
+                   (r.get("latest_sender") or "").strip())
+            if not key[0] and not key[1]:
+                # No identifying info — keep each row separate to avoid
+                # collapsing legitimately different anonymous mail.
+                bucket[("__solo__", id(r))] = {**r, "collapsed_count": 1}
+                continue
+            if key in bucket:
+                bucket[key]["collapsed_count"] += 1
+                bucket[key]["msg_count"] += r.get("msg_count", 0) or 0
+            else:
+                bucket[key] = {**r, "collapsed_count": 1}
+        rows = list(bucket.values())
+
+    # Per-verdict counts AFTER collapse (so headers + chip strip reflect
+    # what's actually visible in the table).
     group_counts: dict[str, int] = {}
     for r in rows:
-        v = r["latest_verdict"] or "(unknown)"
+        v = r.get("latest_verdict") or "(unknown)"
         group_counts[v] = group_counts.get(v, 0) + 1
 
     if group_by == "verdict":
@@ -217,9 +246,9 @@ def threads_view():
         # activity first within each group.
         def sort_key(r):
             return (
-                r["latest_verdict"] or "zzz",
+                r.get("latest_verdict") or "zzz",
                 -1 * (datetime.fromisoformat(r["last_activity"]).timestamp()
-                      if r["last_activity"] else 0),
+                      if r.get("last_activity") else 0),
             )
         rows.sort(key=sort_key)
 
@@ -231,6 +260,8 @@ def threads_view():
         limit=limit,
         group_by=group_by,
         group_counts=group_counts,
+        compact=compact,
+        raw_count=raw_count,
     )
 
 
@@ -659,6 +690,8 @@ _DARK_MODE_CSS = """\
   .err, .moved-no { color: #ff9d9d !important; }
   .help, .when, .sender, .reclass-status, .preview { color: #98989f !important; }
   .conv-tail { color: #6c6c72 !important; }
+  .collapsed-chip { background: #1d2a4d !important; color: #cbd6ff !important;
+                    border-color: #3a4c80 !important; }
   .pill.right   { background: #1c3a23 !important; color: #88e89c !important; border-color: #2e6a3a !important; }
   .pill.wrong   { background: #4a1f1f !important; color: #ffb0b0 !important; border-color: #7a3a3a !important; }
   .reclass      { background: #1d2a4d !important; color: #cbd6ff !important; border: 1px solid #3a4c80 !important; }
@@ -1077,6 +1110,10 @@ _THREADS_HTML = """\
              display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical;
              overflow: hidden; }
   .conv-tail { color: #999; font-family: ui-monospace, monospace; font-size: 0.7rem; }
+  .collapsed-chip { display: inline-block; margin-left: 8px;
+                    font-size: 0.7rem; font-weight: 700; padding: 1px 7px;
+                    border-radius: 999px; background: #ecf3ff; color: #2545a6;
+                    border: 1px solid #b4c7f1; vertical-align: middle; cursor: help; }
 </style>
 """ + _DARK_MODE_CSS + _VERDICT_CSS + _NAV + """\
 <h1>Threads {% if current_mailbox %}— {{ current_mailbox }}{% endif %}</h1>
@@ -1094,12 +1131,20 @@ _THREADS_HTML = """\
       <option value="verdict" {% if group_by == 'verdict' %}selected{% endif %}>current verdict</option>
     </select>
   </label>
+  <label>View:
+    <select name="compact" onchange="this.form.submit()">
+      <option value="0" {% if not compact %}selected{% endif %}>all threads</option>
+      <option value="1" {% if compact %}selected{% endif %}>compact (collapse same subject + sender)</option>
+    </select>
+  </label>
   <label>Show:
     <select name="limit" onchange="this.form.submit()">
       {% for n in [100, 200, 500, 1000] %}<option value="{{ n }}" {% if n == limit %}selected{% endif %}>{{ n }}</option>{% endfor %}
     </select>
   </label>
-  <span class="help">{{ rows|length }} thread(s) shown</span>
+  <span class="help">
+    {% if compact %}{{ rows|length }} row(s) (collapsed from {{ raw_count }} thread(s)){% else %}{{ rows|length }} thread(s) shown{% endif %}
+  </span>
 </form>
 
 {% if group_counts %}
@@ -1134,6 +1179,9 @@ _THREADS_HTML = """\
       <td>
         <div class="subj">
           <a class="tlink" href="/threads/{{ r.conversation_id }}?mailbox={{ r.mailbox }}">{{ r.subject or '(no subject)' }}</a>
+          {% if r.collapsed_count and r.collapsed_count > 1 %}
+            <span class="collapsed-chip" title="Collapsed {{ r.collapsed_count }} threads with this exact subject + sender. Link opens the most recent.">× {{ r.collapsed_count }}</span>
+          {% endif %}
         </div>
         <div class="sender">{{ r.latest_sender or '' }} <span class="conv-tail">· {{ r.conversation_id[-8:] }}</span></div>
         {% if r.latest_preview %}
