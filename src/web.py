@@ -657,7 +657,8 @@ _DARK_MODE_CSS = """\
   .verdict      { background: #233055 !important; color: #cbd6ff !important; }
   .mode         { background: #2a2d34 !important; color: #b0b3bb !important; }
   .err, .moved-no { color: #ff9d9d !important; }
-  .help, .when, .sender, .reclass-status { color: #98989f !important; }
+  .help, .when, .sender, .reclass-status, .preview { color: #98989f !important; }
+  .conv-tail { color: #6c6c72 !important; }
   .pill.right   { background: #1c3a23 !important; color: #88e89c !important; border-color: #2e6a3a !important; }
   .pill.wrong   { background: #4a1f1f !important; color: #ffb0b0 !important; border-color: #7a3a3a !important; }
   .reclass      { background: #1d2a4d !important; color: #cbd6ff !important; border: 1px solid #3a4c80 !important; }
@@ -781,6 +782,8 @@ _MAILBOXES_HTML = """\
                             overflow: hidden; margin-top: 6px; }
   .reclass-card .progbar > span { display: block; height: 100%; background: #1aa8ff;
                                   transition: width 250ms ease; }
+  /* Same .preview + .conv-tail rules used on the /threads page; kept here
+     so /changes can adopt them later if needed. */
 </style>
 """ + _DARK_MODE_CSS + _VERDICT_CSS + _NAV + """\
 {% if request.args.get('msg') == 'reclassify-started' %}
@@ -1069,6 +1072,11 @@ _THREADS_HTML = """\
           border-radius: 8px; background: #fff3d4; color: #6b4d00; margin-left: 4px; }
   a.tlink { color: inherit; text-decoration: none; }
   a.tlink:hover { text-decoration: underline; }
+  .preview { color: #666; font-size: 0.8rem; margin-top: 3px;
+             max-width: 700px; line-height: 1.35;
+             display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical;
+             overflow: hidden; }
+  .conv-tail { color: #999; font-family: ui-monospace, monospace; font-size: 0.7rem; }
 </style>
 """ + _DARK_MODE_CSS + _VERDICT_CSS + _NAV + """\
 <h1>Threads {% if current_mailbox %}— {{ current_mailbox }}{% endif %}</h1>
@@ -1127,7 +1135,10 @@ _THREADS_HTML = """\
         <div class="subj">
           <a class="tlink" href="/threads/{{ r.conversation_id }}?mailbox={{ r.mailbox }}">{{ r.subject or '(no subject)' }}</a>
         </div>
-        <div class="sender">{{ r.latest_sender or '' }}</div>
+        <div class="sender">{{ r.latest_sender or '' }} <span class="conv-tail">· {{ r.conversation_id[-8:] }}</span></div>
+        {% if r.latest_preview %}
+          <div class="preview">{{ r.latest_preview[:140] }}{% if r.latest_preview|length > 140 %}…{% endif %}</div>
+        {% endif %}
       </td>
       <td><span class="verdict {{ r.latest_verdict | verdict_class }}">{{ r.latest_verdict }}</span></td>
       <td>{{ r.msg_count }}</td>

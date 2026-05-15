@@ -420,6 +420,9 @@ class Store:
               (SELECT sender FROM decisions
                  WHERE conversation_id = d.conversation_id AND mailbox = d.mailbox
                  ORDER BY created_at DESC LIMIT 1)                 AS latest_sender,
+              (SELECT body_preview FROM decisions
+                 WHERE conversation_id = d.conversation_id AND mailbox = d.mailbox
+                 ORDER BY created_at DESC LIMIT 1)                 AS latest_preview,
               (SELECT COUNT(*) FROM thread_verdicts
                  WHERE conversation_id = d.conversation_id AND mailbox = d.mailbox) AS verdict_count
             FROM decisions d
