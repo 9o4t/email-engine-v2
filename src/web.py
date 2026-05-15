@@ -58,6 +58,19 @@ app = Flask(__name__)
 store = Store()
 
 
+# Jinja filter: map any verdict folder name to a stable color class.
+# Buckets verdicts by their LEADING DIGIT so cross-generation variants
+# (1-Critical, 1-CRITICAL-X, _1-CRITICAL-X) all share the same color.
+@app.template_filter("verdict_class")
+def verdict_class(v: str | None) -> str:
+    if not v:
+        return "vu"
+    for c in v:
+        if c.isdigit():
+            return f"v{c}"
+    return "vu"
+
+
 # --- Auth -------------------------------------------------------------------
 
 def _require_auth(fn):
@@ -189,13 +202,35 @@ def decisions_csv():
 def threads_view():
     mailbox = request.args.get("mailbox") or None
     limit = int(request.args.get("limit", "200"))
+    group_by = request.args.get("group", "date")  # 'date' (default) | 'verdict'
     rows = store.list_threads(mailbox=mailbox, limit=limit)
+
+    # Per-verdict counts for the section headers (always computed so we
+    # can show the same info as a summary even when group=date).
+    group_counts: dict[str, int] = {}
+    for r in rows:
+        v = r["latest_verdict"] or "(unknown)"
+        group_counts[v] = group_counts.get(v, 0) + 1
+
+    if group_by == "verdict":
+        # Sort: verdict ASC (so 1- before 2- before ...), then most recent
+        # activity first within each group.
+        def sort_key(r):
+            return (
+                r["latest_verdict"] or "zzz",
+                -1 * (datetime.fromisoformat(r["last_activity"]).timestamp()
+                      if r["last_activity"] else 0),
+            )
+        rows.sort(key=sort_key)
+
     return render_template_string(
         _THREADS_HTML,
         rows=rows,
         mailboxes=[m.mailbox for m in store.list_mailboxes()],
         current_mailbox=mailbox or "",
         limit=limit,
+        group_by=group_by,
+        group_counts=group_counts,
     )
 
 
@@ -558,6 +593,38 @@ _NAV = """\
 </nav>
 """
 
+_VERDICT_CSS = """\
+<style>
+  /* Verdict color buckets. Use these by adding the v1/v2/.../vu class
+     to a .verdict span. Same color regardless of underscore-prefix or
+     -X suffix variants — the verdict_class filter normalizes them. */
+  .verdict.v1 { background: #ffe1e1; color: #7a1212; border: 1px solid #d04040; }
+  .verdict.v2 { background: #ffe5cf; color: #7a3f00; border: 1px solid #e07a1f; }
+  .verdict.v3 { background: #e6dcff; color: #3f1e7a; border: 1px solid #7e57c2; }
+  .verdict.v4 { background: #fff3c8; color: #5e4a00; border: 1px solid #d4a82a; }
+  .verdict.v5 { background: #d8eede; color: #1e5232; border: 1px solid #5c9b76; }
+  .verdict.vu { background: #ececf0; color: #555;    border: 1px solid #b6b6bd; }
+  .verdict { font-family: ui-monospace, "Cascadia Mono", Menlo, monospace;
+             font-size: 0.78rem; font-weight: 600; padding: 2px 8px;
+             border-radius: 999px; letter-spacing: 0.2px; white-space: nowrap; }
+  /* Section header rows on grouped tables */
+  tr.grouphdr td { background: #f5f5f8; font-weight: 700; padding: 10px 8px;
+                   border-top: 2px solid #d6d6dc; border-bottom: 1px solid #d6d6dc; }
+  tr.grouphdr .group-count { font-weight: 400; color: #777; margin-left: 8px; font-size: 0.85rem; }
+</style>
+<style media="(prefers-color-scheme: dark)">
+  .verdict.v1 { background: #4a1d1d !important; color: #ffb3b3 !important; border-color: #7a3a3a !important; }
+  .verdict.v2 { background: #3a2510 !important; color: #ffc798 !important; border-color: #6a4520 !important; }
+  .verdict.v3 { background: #2a1f4a !important; color: #cbb6ff !important; border-color: #5a4a98 !important; }
+  .verdict.v4 { background: #3a2f10 !important; color: #ffdc80 !important; border-color: #6a5520 !important; }
+  .verdict.v5 { background: #1f3025 !important; color: #b3d8c4 !important; border-color: #3a6045 !important; }
+  .verdict.vu { background: #2a2c34 !important; color: #c0c2c8 !important; border-color: #4a4d55 !important; }
+  tr.grouphdr td { background: #1c1f26 !important; border-top-color: #2c2f36 !important; border-bottom-color: #2c2f36 !important; color: #d6d8dd !important; }
+  tr.grouphdr .group-count { color: #98989f !important; }
+</style>
+"""
+
+
 # Single dark-mode override block prepended to every page. Uses
 # prefers-color-scheme so it follows your OS setting (no manual toggle —
 # add one later if you find yourself flipping between modes a lot).
@@ -609,7 +676,7 @@ _DECISIONS_HTML = """\
   table { border-collapse: collapse; width: 100%; }
   th, td { padding: 6px 8px; border-bottom: 1px solid #eee; vertical-align: top; }
   th { text-align: left; background: #fafafa; }
-  .verdict { font-family: ui-monospace, monospace; font-size: 0.85rem; padding: 2px 6px; border-radius: 4px; background: #eef; }
+  /* .verdict styles live in _VERDICT_CSS (colored by leading digit). */
   .mode { font-size: 0.75rem; padding: 1px 5px; border-radius: 3px; background: #f3f3f3; color: #555; margin-left: 4px; }
   .err { color: #b00; font-size: 0.85rem; }
   .pill { display: inline-block; padding: 2px 8px; border-radius: 12px; font-size: 0.8rem; cursor: pointer; margin-right: 4px; }
@@ -620,7 +687,7 @@ _DECISIONS_HTML = """\
   .sender { color: #555; font-size: 0.85rem; }
   .when { color: #777; font-size: 0.8rem; white-space: nowrap; }
 </style>
-""" + _DARK_MODE_CSS + _NAV + """\
+""" + _DARK_MODE_CSS + _VERDICT_CSS + _NAV + """\
 <h1>Recent classifications {% if current_mailbox %}— {{ current_mailbox }}{% endif %}</h1>
 
 <form method="get" style="margin-bottom: 1rem;">
@@ -648,7 +715,7 @@ _DECISIONS_HTML = """\
         <div class="sender">{{ d.sender or '' }}</div>
       </td>
       <td>
-        <span class="verdict">{{ d.verdict_folder }}</span>
+        <span class="verdict {{ d.verdict_folder | verdict_class }}">{{ d.verdict_folder }}</span>
         <span class="mode">{{ d.apply_mode or '?' }}</span>
         {% if d.apply_error %}<div class="err">{{ d.apply_error }}</div>{% endif %}
         {% if not d.moved and d.apply_mode and d.apply_mode != 'tag' %}<div style="font-size:0.8rem;color:#a60">not moved</div>{% endif %}
@@ -715,7 +782,7 @@ _MAILBOXES_HTML = """\
   .reclass-card .progbar > span { display: block; height: 100%; background: #1aa8ff;
                                   transition: width 250ms ease; }
 </style>
-""" + _DARK_MODE_CSS + _NAV + """\
+""" + _DARK_MODE_CSS + _VERDICT_CSS + _NAV + """\
 {% if request.args.get('msg') == 'reclassify-started' %}
   <div class="banner ok">Reclassify started — walks INBOX + every legacy <code>…-X</code> folder. Watch <a href="/">decisions</a> or poll <code>/api/reclassify/&lt;email&gt;/status</code>.</div>
 {% elif request.args.get('msg') == 'already-running' %}
@@ -978,7 +1045,7 @@ _HIERARCHY_HTML = """\
   }
   .path { color: #666; font-size: 0.85rem; }
 </style>
-""" + _DARK_MODE_CSS + _NAV + """\
+""" + _DARK_MODE_CSS + _VERDICT_CSS + _NAV + """\
 <h2>{{ mailbox }} — taxonomy</h2>
 <p class="path">Source: <code>{{ path }}</code></p>
 <p>Edit this file in your fork's <code>src/data/hierarchies/</code> and push to update. Cache invalidates on every feedback submission, so no restart needed once the file lands in the container.</p>
@@ -994,8 +1061,7 @@ _THREADS_HTML = """\
   table { border-collapse: collapse; width: 100%; }
   th, td { padding: 6px 8px; border-bottom: 1px solid #eee; vertical-align: top; }
   th { text-align: left; background: #fafafa; }
-  .verdict { font-family: ui-monospace, monospace; font-size: 0.85rem;
-             padding: 2px 6px; border-radius: 4px; background: #eef; }
+  /* .verdict styles live in _VERDICT_CSS (colored by leading digit). */
   .when { color: #777; font-size: 0.8rem; white-space: nowrap; }
   .subj { font-weight: 600; }
   .sender, .help { color: #555; font-size: 0.85rem; }
@@ -1004,7 +1070,7 @@ _THREADS_HTML = """\
   a.tlink { color: inherit; text-decoration: none; }
   a.tlink:hover { text-decoration: underline; }
 </style>
-""" + _DARK_MODE_CSS + _NAV + """\
+""" + _DARK_MODE_CSS + _VERDICT_CSS + _NAV + """\
 <h1>Threads {% if current_mailbox %}— {{ current_mailbox }}{% endif %}</h1>
 
 <form method="get" style="margin-bottom: 1rem;">
@@ -1012,6 +1078,12 @@ _THREADS_HTML = """\
     <select name="mailbox" onchange="this.form.submit()">
       <option value="">(all)</option>
       {% for m in mailboxes %}<option value="{{ m }}" {% if m == current_mailbox %}selected{% endif %}>{{ m }}</option>{% endfor %}
+    </select>
+  </label>
+  <label>Group by:
+    <select name="group" onchange="this.form.submit()">
+      <option value="date"    {% if group_by == 'date' %}selected{% endif %}>most-recent activity</option>
+      <option value="verdict" {% if group_by == 'verdict' %}selected{% endif %}>current verdict</option>
     </select>
   </label>
   <label>Show:
@@ -1022,13 +1094,32 @@ _THREADS_HTML = """\
   <span class="help">{{ rows|length }} thread(s) shown</span>
 </form>
 
+{% if group_counts %}
+<div style="margin: 0 0 1rem; font-size: 0.85rem;">
+  <span class="help">verdict mix:</span>
+  {% for v, n in group_counts.items() | sort %}
+    <span class="verdict {{ v | verdict_class }}" style="margin-right: 4px;">{{ v }} · {{ n }}</span>
+  {% endfor %}
+</div>
+{% endif %}
+
 <table>
   <thead><tr>
     <th>Last activity</th><th>Mailbox</th><th>Thread (latest)</th>
     <th>Current verdict</th><th># msgs</th><th>Verdict history</th>
   </tr></thead>
   <tbody>
+    {% set ns = namespace(prev_v=None) %}
     {% for r in rows %}
+      {% if group_by == 'verdict' and r.latest_verdict != ns.prev_v %}
+        {% set ns.prev_v = r.latest_verdict %}
+        <tr class="grouphdr">
+          <td colspan="6">
+            <span class="verdict {{ r.latest_verdict | verdict_class }}">{{ r.latest_verdict or '(unknown)' }}</span>
+            <span class="group-count">{{ group_counts.get(r.latest_verdict or '(unknown)', 0) }} thread(s)</span>
+          </td>
+        </tr>
+      {% endif %}
     <tr>
       <td class="when">{{ r.last_activity[:19].replace('T',' ') if r.last_activity else '' }}</td>
       <td>{{ r.mailbox }}</td>
@@ -1038,7 +1129,7 @@ _THREADS_HTML = """\
         </div>
         <div class="sender">{{ r.latest_sender or '' }}</div>
       </td>
-      <td><span class="verdict">{{ r.latest_verdict }}</span></td>
+      <td><span class="verdict {{ r.latest_verdict | verdict_class }}">{{ r.latest_verdict }}</span></td>
       <td>{{ r.msg_count }}</td>
       <td>
         {{ r.verdict_count or 0 }} verdict(s)
@@ -1059,8 +1150,7 @@ _THREAD_DETAIL_HTML = """\
   table { border-collapse: collapse; width: 100%; margin-bottom: 1.5rem; }
   th, td { padding: 6px 8px; border-bottom: 1px solid #eee; vertical-align: top; }
   th { text-align: left; background: #fafafa; }
-  .verdict { font-family: ui-monospace, monospace; font-size: 0.85rem;
-             padding: 2px 6px; border-radius: 4px; background: #eef; }
+  /* .verdict styles live in _VERDICT_CSS (colored by leading digit). */
   .arrow { color: #888; }
   .when { color: #777; font-size: 0.8rem; white-space: nowrap; }
   .reason { color: #555; font-style: italic; font-size: 0.85rem;
@@ -1069,7 +1159,7 @@ _THREAD_DETAIL_HTML = """\
   code { background: #f0f0f4; padding: 1px 4px; border-radius: 3px; font-size: 0.8rem; }
   .changed { background: #fff8db; }
 </style>
-""" + _DARK_MODE_CSS + _NAV + """\
+""" + _DARK_MODE_CSS + _VERDICT_CSS + _NAV + """\
 <h2>Thread <code>{{ conversation_id[:24] }}…</code></h2>
 <p class="help" style="color: #666; font-size: 0.85rem; margin-top: -8px;">Mailbox: {{ mailbox }}</p>
 
@@ -1082,9 +1172,9 @@ _THREAD_DETAIL_HTML = """\
       <td class="when">{{ h.decided_at[:19].replace('T',' ') }}</td>
       <td>
         {% if h.prev_verdict and h.prev_verdict != h.verdict_folder %}
-          <span class="verdict">{{ h.prev_verdict }}</span> <span class="arrow">→</span>
+          <span class="verdict {{ h.prev_verdict | verdict_class }}">{{ h.prev_verdict }}</span> <span class="arrow">→</span>
         {% endif %}
-        <span class="verdict">{{ h.verdict_folder }}</span>
+        <span class="verdict {{ h.verdict_folder | verdict_class }}">{{ h.verdict_folder }}</span>
       </td>
       <td>{{ (h.trigger_subject or '')[:80] }}</td>
       <td>{{ h.trigger_sender or '' }}</td>
@@ -1104,7 +1194,7 @@ _THREAD_DETAIL_HTML = """\
       <td class="when">{{ d.created_at[:19].replace('T',' ') }}</td>
       <td>{{ d.sender }}</td>
       <td>{{ (d.subject or '(no subject)')[:80] }}</td>
-      <td><span class="verdict">{{ d.verdict_folder }}</span></td>
+      <td><span class="verdict {{ d.verdict_folder | verdict_class }}">{{ d.verdict_folder }}</span></td>
       <td>{% if d.tagged %}✓{% else %}—{% endif %}</td>
       <td>{% if d.moved %}✓{% else %}—{% endif %}</td>
       <td class="err">{{ d.apply_error or '' }}</td>
@@ -1123,8 +1213,7 @@ _CHANGES_HTML = """\
   table { border-collapse: collapse; width: 100%; }
   th, td { padding: 6px 8px; border-bottom: 1px solid #eee; vertical-align: top; }
   th { text-align: left; background: #fafafa; }
-  .verdict { font-family: ui-monospace, monospace; font-size: 0.85rem;
-             padding: 2px 6px; border-radius: 4px; background: #eef; }
+  /* .verdict styles live in _VERDICT_CSS (colored by leading digit). */
   .arrow { color: #888; font-weight: 700; }
   .when { color: #777; font-size: 0.8rem; white-space: nowrap; }
   .subj { font-weight: 600; }
@@ -1134,7 +1223,7 @@ _CHANGES_HTML = """\
   a.tlink { color: inherit; text-decoration: none; }
   a.tlink:hover { text-decoration: underline; }
 </style>
-""" + _DARK_MODE_CSS + _NAV + """\
+""" + _DARK_MODE_CSS + _VERDICT_CSS + _NAV + """\
 <h1>Verdict changes {% if current_mailbox %}— {{ current_mailbox }}{% endif %}</h1>
 
 <form method="get" style="margin-bottom: 1rem;">
@@ -1176,10 +1265,10 @@ _CHANGES_HTML = """\
       </td>
       <td>
         {% if r.prev_verdict %}
-          <span class="verdict">{{ r.prev_verdict }}</span>
+          <span class="verdict {{ r.prev_verdict | verdict_class }}">{{ r.prev_verdict }}</span>
           <span class="arrow">→</span>
         {% endif %}
-        <span class="verdict">{{ r.verdict_folder }}</span>
+        <span class="verdict {{ r.verdict_folder | verdict_class }}">{{ r.verdict_folder }}</span>
       </td>
       <td class="reason">{{ r.reason or r.model_raw or '' }}</td>
     </tr>
