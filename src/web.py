@@ -210,23 +210,43 @@ def mailboxes_delete(email: str):
 @_require_auth
 def mailboxes_reclassify(email: str):
     """Kick off a reclassify-all in a background thread. One job per
-    mailbox at a time — second click while running is a no-op."""
+    mailbox at a time — second click while running is a no-op.
+
+    Form param `days_back` (int, optional): if set, limit the walk to
+    threads received within the last N days. Omit or set to 0 for the
+    full inbox history.
+    """
     if not store.get_mailbox(email):
         abort(404, "unknown mailbox")
+
+    days_back_raw = (request.form.get("days_back") or "").strip()
+    days_back: int | None = None
+    if days_back_raw:
+        try:
+            v = int(days_back_raw)
+            if v > 0:
+                days_back = v
+        except ValueError:
+            abort(400, "days_back must be an integer or blank")
+
     with _reclassify_lock:
         cur = _reclassify_state.get(email)
         if cur and cur.get("running"):
             return Response(status=303, headers={"Location": "/mailboxes?msg=already-running"})
-        _reclassify_state[email] = {"running": True, "started_at": _now_iso(), "summary": None, "error": None}
+        _reclassify_state[email] = {
+            "running": True, "started_at": _now_iso(),
+            "days_back": days_back, "summary": None, "error": None,
+        }
 
     def _worker():
         try:
-            summary = reclassify_all(email)
+            summary = reclassify_all(email, days_back=days_back)
             with _reclassify_lock:
                 _reclassify_state[email] = {
                     "running": False,
                     "started_at": _reclassify_state[email].get("started_at"),
                     "finished_at": _now_iso(),
+                    "days_back": days_back,
                     "summary": summary, "error": None,
                 }
         except Exception as e:
@@ -236,6 +256,7 @@ def mailboxes_reclassify(email: str):
                     "running": False,
                     "started_at": _reclassify_state[email].get("started_at"),
                     "finished_at": _now_iso(),
+                    "days_back": days_back,
                     "summary": None, "error": str(e),
                 }
 
@@ -464,11 +485,23 @@ _MAILBOXES_HTML = """\
     </form>
     <tr>
       <td colspan="7" style="border-bottom: 2px solid #f0f0f0; padding-bottom: 12px;">
-        <form method="post" action="/mailboxes/{{ m.mailbox }}/reclassify" style="display:inline"
-              onsubmit="return confirm('Reclassify ALL emails in INBOX plus every legacy ...-X folder for {{ m.mailbox }}? This walks every thread once through the new logic. Existing folder contents will move based on the new verdict.')">
-          <button type="submit" class="reclass">↻ Reclassify all</button>
+        <form method="post" action="/mailboxes/{{ m.mailbox }}/reclassify" style="display:inline-flex; gap:6px; align-items:center; flex-wrap:wrap;"
+              id="reclass-form-{{ m.mailbox }}"
+              onsubmit="return confirm('Reclassify {{ m.mailbox }}? Scope: ' + (document.getElementById('days-{{ m.mailbox }}').value ? 'last ' + document.getElementById('days-{{ m.mailbox }}').value + ' day(s)' : 'ALL history') + '. Walks INBOX plus every legacy …-X folder, newest first.')">
+          <button type="submit" class="reclass">↻ Reclassify</button>
+          <span class="help" style="margin-left:4px">last</span>
+          <input type="number" min="1" max="3650" name="days_back" placeholder="all"
+                 id="days-{{ m.mailbox }}" style="width:72px" title="Blank = walk all history">
+          <span class="help">day(s)</span>
+          <span class="help" style="margin-left:6px">quick:</span>
+          {% for d in [7, 14, 30, 90] %}
+            <button type="button" class="reclass" style="font-size:0.72rem;padding:1px 6px"
+                    onclick="document.getElementById('days-{{ m.mailbox }}').value = {{ d }}">{{ d }}d</button>
+          {% endfor %}
+          <button type="button" class="reclass" style="font-size:0.72rem;padding:1px 6px"
+                  onclick="document.getElementById('days-{{ m.mailbox }}').value = ''">all</button>
         </form>
-        <form method="post" action="/mailboxes/{{ m.mailbox }}/delete" style="display:inline"
+        <form method="post" action="/mailboxes/{{ m.mailbox }}/delete" style="display:inline; margin-left: 12px;"
               onsubmit="return confirm('Remove this mailbox? Decisions stay, polling stops.')">
           <button type="submit" style="font-size:0.75rem;color:#a00">delete</button>
         </form>
@@ -515,9 +548,10 @@ For <strong>imap</strong>: set <code>IMAP_&lt;SANITIZED_EMAIL&gt;_PASSWORD</code
   const mailboxes = {{ mailboxes | map(attribute='mailbox') | list | tojson }};
   function fmt(s) {
     if (!s) return '';
-    if (s.running) return `… reclassifying (started ${s.started_at?.slice(11,19) || ''}Z)`;
-    if (s.error)   return `✗ last reclassify error: ${s.error}`;
-    if (s.summary) return `✓ last reclassify: ${s.summary.threads_classified || 0} thread(s), ${s.summary.errors || 0} error(s) across ${s.summary.folders_walked || 0} folder(s)`;
+    const scope = s.days_back ? `last ${s.days_back}d` : 'all history';
+    if (s.running) return `… reclassifying (${scope}, started ${s.started_at?.slice(11,19) || ''}Z)`;
+    if (s.error)   return `✗ last reclassify (${scope}) error: ${s.error}`;
+    if (s.summary) return `✓ last reclassify (${scope}): ${s.summary.threads_classified || 0} thread(s), ${s.summary.errors || 0} error(s) across ${s.summary.folders_walked || 0} folder(s)`;
     return '';
   }
   async function tick() {

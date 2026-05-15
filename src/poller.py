@@ -305,11 +305,20 @@ def run(store: Store, llm: LLMConfig) -> None:
     log.info("poller exited cleanly")
 
 
-def reclassify_all(mailbox_email: str, store: Store | None = None, llm: LLMConfig | None = None) -> dict:
+def reclassify_all(
+    mailbox_email: str,
+    store: Store | None = None,
+    llm: LLMConfig | None = None,
+    *,
+    days_back: int | None = None,
+) -> dict:
     """One-shot reclassification: walk INBOX + every legacy v1 folder,
     classify each thread once (per-conversation dedup), apply verdict to
-    every message in the thread. Resets the watermark afterward so the
-    normal poller resumes from the latest message.
+    every message in the thread.
+
+    `days_back`: limit to threads with received_at within the last N days.
+    None = unlimited (walks the entire history). When set, the desc walker
+    stops as soon as the page cursor steps before now() - days_back.
 
     Designed to be called from a Flask background thread (see web.py).
     Returns a summary dict for logs / UI feedback.
@@ -319,6 +328,11 @@ def reclassify_all(mailbox_email: str, store: Store | None = None, llm: LLMConfi
     mb = store.get_mailbox(mailbox_email)
     if not mb:
         return {"ok": False, "error": f"unknown mailbox {mailbox_email!r}"}
+
+    from datetime import timedelta
+    stop_at: datetime | None = None
+    if days_back and days_back > 0:
+        stop_at = datetime.now(timezone.utc) - timedelta(days=days_back)
 
     provider = make_provider(
         mb.mailbox, mb.provider,
@@ -342,8 +356,11 @@ def reclassify_all(mailbox_email: str, store: Store | None = None, llm: LLMConfi
     started_at = datetime.now(timezone.utc)
     store.set_watermark(mb.mailbox, started_at)
 
-    log.info("[reclassify] starting for %s across %d folder(s) (newest-first, watermark→%s)",
-             mb.mailbox, len(folders_to_walk), started_at.isoformat())
+    log.info(
+        "[reclassify] starting for %s across %d folder(s) (newest-first, watermark→%s, stop_at=%s)",
+        mb.mailbox, len(folders_to_walk), started_at.isoformat(),
+        stop_at.isoformat() if stop_at else "none (all history)",
+    )
 
     for folder in folders_to_walk:
         if _STOP:
@@ -367,8 +384,17 @@ def reclassify_all(mailbox_email: str, store: Store | None = None, llm: LLMConfi
                 break
             if not batch:
                 break
+            hit_stop = False
             for m in batch:
                 if _STOP:
+                    break
+                # Honor days_back: stop once we walk past the cutoff. We
+                # still update the cursor so the break propagates cleanly.
+                if stop_at and m.received_at and m.received_at < stop_at:
+                    log.info("[reclassify] hit stop_at (%s) in %s — stopping folder walk",
+                             stop_at.isoformat(), folder)
+                    cursor = m.received_at
+                    hit_stop = True
                     break
                 if m.conversation_id and m.conversation_id in seen:
                     if m.received_at and (cursor is None or m.received_at < cursor):
@@ -385,7 +411,7 @@ def reclassify_all(mailbox_email: str, store: Store | None = None, llm: LLMConfi
                     counts["errors"] += 1
                 if m.received_at and (cursor is None or m.received_at < cursor):
                     cursor = m.received_at
-            if len(batch) < page:
+            if hit_stop or len(batch) < page:
                 break
         log.info("[reclassify] folder %s done (threads=%d errors=%d)",
                  folder, counts["threads_classified"], counts["errors"])
