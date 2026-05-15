@@ -257,6 +257,10 @@ def mailboxes_reclassify(email: str):
         }
         _reclassify_state[email] = state
 
+    # Persist the initial "started" snapshot so it survives a redeploy
+    # even if the worker thread never gets to finish.
+    store.upsert_job(email, "reclassify", state)
+
     def _worker():
         try:
             reclassify_all(email, days_back=days_back, progress=state["progress"])
@@ -269,6 +273,12 @@ def mailboxes_reclassify(email: str):
                 state["running"] = False
                 state["finished_at"] = _now_iso()
                 state["error"] = str(e)
+        # Always persist final state — success or failure — so the card
+        # on /mailboxes survives a redeploy.
+        try:
+            store.upsert_job(email, "reclassify", state)
+        except Exception:
+            log.exception("could not persist reclassify state for %s", email)
 
     threading.Thread(target=_worker, daemon=True, name=f"reclassify-{email}").start()
     return Response(status=303, headers={"Location": "/mailboxes?msg=reclassify-started"})
@@ -277,8 +287,17 @@ def mailboxes_reclassify(email: str):
 @app.get("/api/reclassify/<path:email>/status")
 @_require_auth
 def reclassify_status(email: str):
+    # In-memory state is the freshest (mid-run); fall back to the
+    # persisted SQLite row from the previous run so the card on
+    # /mailboxes is never blank after a redeploy.
     with _reclassify_lock:
-        return jsonify(_reclassify_state.get(email, {"running": False, "summary": None}))
+        cur = _reclassify_state.get(email)
+    if cur:
+        return jsonify(cur)
+    persisted = store.get_job(email, "reclassify")
+    if persisted:
+        return jsonify(persisted)
+    return jsonify({"running": False, "progress": None})
 
 
 # --- Sweep folder → Inbox ---------------------------------------------------
@@ -318,6 +337,8 @@ def mailboxes_sweep_to_inbox(email: str):
         }
         _sweep_state[email] = state
 
+    store.upsert_job(email, "sweep", state)
+
     def _worker():
         try:
             from providers import make_provider
@@ -335,6 +356,10 @@ def mailboxes_sweep_to_inbox(email: str):
                 state["running"] = False
                 state["finished_at"] = _now_iso()
                 state["error"] = str(e)
+        try:
+            store.upsert_job(email, "sweep", state)
+        except Exception:
+            log.exception("could not persist sweep state for %s", email)
 
     threading.Thread(target=_worker, daemon=True, name=f"sweep-{email}").start()
     return Response(status=303, headers={"Location": "/mailboxes?msg=sweep-started"})
@@ -344,7 +369,13 @@ def mailboxes_sweep_to_inbox(email: str):
 @_require_auth
 def sweep_status(email: str):
     with _sweep_lock:
-        return jsonify(_sweep_state.get(email, {"running": False}))
+        cur = _sweep_state.get(email)
+    if cur:
+        return jsonify(cur)
+    persisted = store.get_job(email, "sweep")
+    if persisted:
+        return jsonify(persisted)
+    return jsonify({"running": False, "progress": None})
 
 
 def _now_iso() -> str:

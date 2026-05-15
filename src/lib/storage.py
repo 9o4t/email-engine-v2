@@ -78,6 +78,14 @@ CREATE TABLE IF NOT EXISTS feedback (
     note         TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_feedback_decision ON feedback(decision_id);
+
+CREATE TABLE IF NOT EXISTS jobs (
+    mailbox     TEXT NOT NULL,
+    job_type    TEXT NOT NULL,        -- 'reclassify' | 'sweep'
+    state_json  TEXT NOT NULL,        -- serialized state dict the UI renders
+    updated_at  TEXT NOT NULL,
+    PRIMARY KEY (mailbox, job_type)
+);
 """
 
 
@@ -293,6 +301,39 @@ class Store:
                 (fid, now, decision_id, 1 if correct else 0, suggested, note),
             )
         return fid
+
+    # --- jobs (reclassify / sweep state, survives redeploys) ---------------
+
+    def upsert_job(self, mailbox: str, job_type: str, state: dict) -> None:
+        """Persist a job's full state dict. Called by the worker at start,
+        end, and (optionally) periodically as it progresses. The state
+        survives container redeploys so the /mailboxes card always shows
+        the last known result, not a blank slate."""
+        import json as _json
+        now = datetime.now(timezone.utc).isoformat()
+        with self._conn() as c:
+            c.execute(
+                """INSERT INTO jobs (mailbox, job_type, state_json, updated_at)
+                   VALUES (?, ?, ?, ?)
+                   ON CONFLICT(mailbox, job_type) DO UPDATE SET
+                     state_json=excluded.state_json,
+                     updated_at=excluded.updated_at""",
+                (mailbox, job_type, _json.dumps(state), now),
+            )
+
+    def get_job(self, mailbox: str, job_type: str) -> dict | None:
+        import json as _json
+        with self._conn() as c:
+            row = c.execute(
+                "SELECT state_json FROM jobs WHERE mailbox = ? AND job_type = ?",
+                (mailbox, job_type),
+            ).fetchone()
+        if not row:
+            return None
+        try:
+            return _json.loads(row["state_json"])
+        except Exception:
+            return None
 
     def feedback_export(self, mailbox: str | None = None) -> list[dict]:
         sql = """
