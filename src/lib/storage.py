@@ -108,6 +108,34 @@ CREATE TABLE IF NOT EXISTS thread_verdicts (
 );
 CREATE INDEX IF NOT EXISTS idx_tv_conv ON thread_verdicts(mailbox, conversation_id, decided_at DESC);
 CREATE INDEX IF NOT EXISTS idx_tv_decided ON thread_verdicts(mailbox, decided_at DESC);
+
+-- Per-thread persistent summary surfaced to downstream consumers (synct
+-- now, portals later). One row per (mailbox, threadKey). Maintained in
+-- the same LLM call as the classifier — per-update cost is constant
+-- because we feed the LLM the *prior summary* + the new message only,
+-- never the full thread.
+--
+-- threadKey is provider-prefixed:
+--    "ms:<conversationId>"  (Microsoft Graph)
+--    "gm:<conversationId>"  (Gmail / IMAP — uses X-GM-THRID for Gmail)
+-- JSON columns are stored as TEXT (SQLite has no native JSON type;
+-- Postgres-compatible — JSONB cast works on migration). Status enum
+-- is stored as TEXT for the same reason.
+CREATE TABLE IF NOT EXISTS thread_summaries (
+    mailbox            TEXT NOT NULL,
+    thread_key         TEXT NOT NULL,
+    summary            TEXT NOT NULL DEFAULT '',
+    key_facts          TEXT NOT NULL DEFAULT '[]',   -- JSON: [{label, value}]
+    timeline           TEXT NOT NULL DEFAULT '[]',   -- JSON: [{date, event, messageId}]
+    contacts           TEXT NOT NULL DEFAULT '[]',   -- JSON: [{name, email, role, organization, phone}]
+    last_message_id    TEXT,
+    last_message_at    TEXT,                          -- ISO-8601 UTC
+    message_count      INTEGER NOT NULL DEFAULT 0,
+    status             TEXT NOT NULL DEFAULT 'fresh', -- 'fresh' | 'stale' | 'errored'
+    updated_at         TEXT NOT NULL,
+    PRIMARY KEY (mailbox, thread_key)
+);
+CREATE INDEX IF NOT EXISTS idx_ts_last_message_at ON thread_summaries(last_message_at);
 """
 
 
@@ -123,6 +151,36 @@ class MailboxConfig:
     imap_port: int
     poll_interval: int
     notes: str
+
+
+@dataclass
+class ThreadSummary:
+    mailbox: str
+    thread_key: str
+    summary: str
+    key_facts: list[dict]
+    timeline: list[dict]
+    contacts: list[dict]
+    last_message_id: str | None
+    last_message_at: str | None
+    message_count: int
+    status: str
+    updated_at: str
+
+
+# Provider → threadKey prefix. The contract synct relies on:
+#   ms:<conversationId>  (Microsoft Graph)
+#   gm:<conversationId>  (Gmail / IMAP — value comes from X-GM-THRID for Gmail
+#                         or the IMAP Message-ID for vanilla servers)
+THREAD_KEY_PREFIX = {"graph": "ms", "imap": "gm"}
+
+
+def make_thread_key(provider: str, conversation_id: str) -> str:
+    """Compose the provider-prefixed thread key downstream consumers query by.
+    Returns '' if conversation_id is empty so callers can short-circuit."""
+    if not conversation_id:
+        return ""
+    return f"{THREAD_KEY_PREFIX.get(provider, provider)}:{conversation_id}"
 
 
 @dataclass
@@ -472,6 +530,79 @@ class Store:
             ).fetchall()
         return [dict(r) for r in rows]
 
+    # --- thread_summaries (one row per (mailbox, thread_key)) --------------
+
+    def get_thread_summary(
+        self, mailbox: str, thread_key: str,
+    ) -> ThreadSummary | None:
+        """Return the current summary state for this thread, or None if
+        the thread has never been summarized (cold start)."""
+        if not thread_key:
+            return None
+        with self._conn() as c:
+            row = c.execute(
+                """SELECT * FROM thread_summaries
+                   WHERE mailbox = ? AND thread_key = ?""",
+                (mailbox, thread_key),
+            ).fetchone()
+        return _row_to_thread_summary(row) if row else None
+
+    def find_thread_summaries_by_key(self, thread_key: str) -> list[ThreadSummary]:
+        """Return every ThreadSummary matching this thread_key across all
+        mailboxes. Used by the read endpoint when the caller didn't pin
+        a mailbox — usually one row, but a forwarded thread could appear
+        in two mailboxes with the same conversation id."""
+        if not thread_key:
+            return []
+        with self._conn() as c:
+            rows = c.execute(
+                "SELECT * FROM thread_summaries WHERE thread_key = ?",
+                (thread_key,),
+            ).fetchall()
+        return [_row_to_thread_summary(r) for r in rows]
+
+    def upsert_thread_summary(
+        self, *,
+        mailbox: str,
+        thread_key: str,
+        summary: str,
+        key_facts: list[dict],
+        timeline: list[dict],
+        contacts: list[dict],
+        last_message_id: str | None,
+        last_message_at: str | None,
+        message_count: int,
+        status: str,
+    ) -> None:
+        """Write the new ThreadSummary state. Replaces the prior row."""
+        import json as _json
+        now = datetime.now(timezone.utc).isoformat()
+        with self._conn() as c:
+            c.execute(
+                """INSERT INTO thread_summaries
+                     (mailbox, thread_key, summary, key_facts, timeline, contacts,
+                      last_message_id, last_message_at, message_count, status, updated_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                   ON CONFLICT(mailbox, thread_key) DO UPDATE SET
+                     summary=excluded.summary,
+                     key_facts=excluded.key_facts,
+                     timeline=excluded.timeline,
+                     contacts=excluded.contacts,
+                     last_message_id=excluded.last_message_id,
+                     last_message_at=excluded.last_message_at,
+                     message_count=excluded.message_count,
+                     status=excluded.status,
+                     updated_at=excluded.updated_at""",
+                (
+                    mailbox, thread_key, summary,
+                    _json.dumps(key_facts or []),
+                    _json.dumps(timeline or []),
+                    _json.dumps(contacts or []),
+                    last_message_id, last_message_at,
+                    int(message_count), status, now,
+                ),
+            )
+
     def feedback_export(self, mailbox: str | None = None) -> list[dict]:
         sql = """
             SELECT d.mailbox, d.provider, d.sender, d.subject, d.body_preview,
@@ -502,6 +633,30 @@ def _row_to_mailbox(r: sqlite3.Row) -> MailboxConfig:
         imap_port=r["imap_port"],
         poll_interval=r["poll_interval"],
         notes=r["notes"],
+    )
+
+
+def _row_to_thread_summary(r: sqlite3.Row) -> ThreadSummary:
+    import json as _json
+    def _load(s: str | None, default):
+        if not s:
+            return default
+        try:
+            return _json.loads(s)
+        except Exception:
+            return default
+    return ThreadSummary(
+        mailbox=r["mailbox"],
+        thread_key=r["thread_key"],
+        summary=r["summary"] or "",
+        key_facts=_load(r["key_facts"], []),
+        timeline=_load(r["timeline"], []),
+        contacts=_load(r["contacts"], []),
+        last_message_id=r["last_message_id"],
+        last_message_at=r["last_message_at"],
+        message_count=r["message_count"] or 0,
+        status=r["status"] or "fresh",
+        updated_at=r["updated_at"],
     )
 
 

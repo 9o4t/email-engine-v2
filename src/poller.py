@@ -25,7 +25,7 @@ from dotenv import load_dotenv
 
 from classifier import LLMConfig, classify, list_folders
 from lib.apply import apply_verdict
-from lib.storage import MailboxConfig, Store
+from lib.storage import MailboxConfig, Store, make_thread_key
 from providers import make_provider, sanitize_mailbox
 from providers.base import LEGACY_RULE_FOLDERS, Message, Provider
 
@@ -202,30 +202,52 @@ def _classify_thread_and_apply(
         if tm.id != latest_msg.id
     ]
 
-    # 3a. Capture the PREVIOUS verdict for this thread BEFORE we touch
-    # anything, so the history row records prev → new transitions
-    # (and the /changes view can surface them).
+    # 3a. Capture the PREVIOUS verdict + prior ThreadSummary for this
+    # thread BEFORE we touch anything, so:
+    #   - the history row records prev → new transitions (/changes view)
+    #   - the LLM gets the compact prior summary instead of the full thread
+    #     (per-update cost is constant regardless of thread depth — the
+    #     cost trick).
     prev_verdict = None
+    prior_summary = None
+    thread_key = make_thread_key(mb.provider, trigger.conversation_id or "")
     if trigger.conversation_id:
         prev_verdict = store.get_latest_thread_verdict(mb.mailbox, trigger.conversation_id)
+    if thread_key:
+        ts = store.get_thread_summary(mb.mailbox, thread_key)
+        if ts:
+            prior_summary = {
+                "summary": ts.summary,
+                "key_facts": ts.key_facts,
+                "timeline": ts.timeline,
+                "contacts": ts.contacts,
+                "message_count": ts.message_count,
+            }
 
-    # 3b. Classify based on the latest message + thread context.
+    # 3b. Classify based on the latest message + (prior summary OR thread
+    # context — never both). When a prior summary exists it IS the
+    # compressed thread context, so we skip the per-message context.
     verdict = classify(
         mailbox=mb.mailbox,
         sender=latest_msg.from_address or latest_msg.from_name,
         subject=latest_msg.subject,
         body=latest_msg.body_text,
-        thread=thread_ctx,
+        thread=thread_ctx if prior_summary is None else None,
+        prior_summary=prior_summary,
+        message_id=latest_msg.id,
+        received_at=latest_msg.received_at.isoformat() if latest_msg.received_at else None,
         cfg=llm,
     )
     folder_name = verdict.folder
 
     # 3c. Append a thread_verdicts row — append-only history, never
     # deleted. This is how the /threads + /changes tabs work.
-    # Reason: best-effort first line of the LLM reply (we strip it down
-    # because Haystack already trimmed to the leaf id, but if the model
-    # is chattier we keep a sentence of context).
-    reason_short = (verdict.raw or "").strip().splitlines()[0][:240] if verdict.raw else None
+    # Reason: prefer the parsed summary (now produced by the same LLM
+    # call); fall back to the first line of raw output for the legacy
+    # plain-id pathway.
+    reason_short = (verdict.summary or "").strip()[:240] or None
+    if not reason_short and verdict.raw:
+        reason_short = verdict.raw.strip().splitlines()[0][:240]
     if trigger.conversation_id:
         try:
             store.record_thread_verdict(
@@ -242,6 +264,39 @@ def _classify_thread_and_apply(
             )
         except Exception as e:
             log.exception("[%s] thread_verdicts insert failed: %s", mb.mailbox, e)
+
+    # 3d. Persist the rolling ThreadSummary (synct consumer). This is the
+    # row downstream apps query at /api/threads/<threadKey>/summary.
+    # `status='errored'` is recorded when the LLM produced invalid JSON
+    # so the next-message update has a chance to fix it (and so callers
+    # can tell the slice is stale).
+    if thread_key:
+        # message_count = real thread size from the provider, not a
+        # local increment. The poller dedupes per thread per cycle, so a
+        # local "++ on every call" undercounts when multiple messages
+        # arrive between polls.
+        try:
+            store.upsert_thread_summary(
+                mailbox=mb.mailbox,
+                thread_key=thread_key,
+                summary=verdict.summary,
+                key_facts=verdict.key_facts,
+                timeline=verdict.timeline,
+                contacts=verdict.contacts,
+                last_message_id=latest_msg.id,
+                last_message_at=(
+                    latest_msg.received_at.isoformat() if latest_msg.received_at else None
+                ),
+                message_count=len(thread),
+                status="errored" if verdict.parse_error else "fresh",
+            )
+            if verdict.parse_error:
+                log.warning(
+                    "[%s] thread_summary parse_error for %s: %s",
+                    mb.mailbox, thread_key, verdict.parse_error,
+                )
+        except Exception as e:
+            log.exception("[%s] thread_summary upsert failed: %s", mb.mailbox, e)
 
     # 4. Wipe stale decisions for this thread before re-inserting — matches
     # v1's DeleteDecisionsForThread step, so the dashboard never shows two

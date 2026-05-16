@@ -37,7 +37,7 @@ from flask import (Flask, Response, abort, after_this_request, jsonify,
 
 from classifier import hierarchy_path_for, invalidate_cache, list_folders
 from lib.apply import APPLY_MODES
-from lib.storage import MailboxConfig, Store
+from lib.storage import MailboxConfig, Store, ThreadSummary
 from poller import reclassify_all
 
 
@@ -87,6 +87,44 @@ def _require_auth(fn):
                 headers={"WWW-Authenticate": 'Basic realm="email-engine-v2"'},
             )
         return fn(*a, **kw)
+    return wrapper
+
+
+def _require_api_auth(fn):
+    """Auth for machine-to-machine API endpoints (synct, portals).
+    Accepts:
+      - Bearer token matching EMAIL_ENGINE_API_KEY env var (preferred)
+      - Basic auth with WEB_USER/WEB_PASS (so manual curls + the
+        dashboard's existing creds still work)
+    Service is locked down (503) until at least one auth method is
+    configured."""
+    @wraps(fn)
+    def wrapper(*a, **kw):
+        api_key = os.getenv("EMAIL_ENGINE_API_KEY", "").strip()
+        user = os.getenv("WEB_USER", "").strip()
+        pw = os.getenv("WEB_PASS", "").strip()
+        if not api_key and not (user and pw):
+            return Response(
+                "API disabled: set EMAIL_ENGINE_API_KEY (or WEB_USER+WEB_PASS).",
+                status=503,
+            )
+        # Bearer token first (case-insensitive scheme; compare key in
+        # constant time to avoid trivial timing-side-channel leaks).
+        hdr = request.headers.get("Authorization", "")
+        if api_key and hdr.lower().startswith("bearer "):
+            import hmac
+            token = hdr[7:].strip()
+            if hmac.compare_digest(token, api_key):
+                return fn(*a, **kw)
+        # Basic auth fallback.
+        if user and pw:
+            a_hdr = request.authorization
+            if a_hdr and a_hdr.username == user and a_hdr.password == pw:
+                return fn(*a, **kw)
+        return Response(
+            "Unauthorized.", status=401,
+            headers={"WWW-Authenticate": 'Bearer realm="email-engine-v2"'},
+        )
     return wrapper
 
 
@@ -348,6 +386,59 @@ def download_db():
     fname = f"email-engine-v2-{datetime.now(timezone.utc).strftime('%Y%m%d-%H%M%S')}.db"
     return send_file(str(snap), as_attachment=True, download_name=fname,
                      mimetype="application/x-sqlite3")
+
+
+# --- ThreadSummary read API (synct now, portals later) ---------------------
+
+def _thread_summary_json(ts: ThreadSummary) -> dict:
+    """Wire shape downstream consumers (synct, portals) parse. Keep the
+    keys camelCase to match the Prisma-style schema synct_utility uses
+    on its side; the SQLite columns stay snake_case server-side."""
+    return {
+        "threadKey":     ts.thread_key,
+        "mailbox":       ts.mailbox,
+        "summary":       ts.summary,
+        "keyFacts":      ts.key_facts,
+        "timeline":      ts.timeline,
+        "contacts":      ts.contacts,
+        "lastMessageId": ts.last_message_id,
+        "lastMessageAt": ts.last_message_at,
+        "messageCount":  ts.message_count,
+        "status":        ts.status,
+        "updatedAt":     ts.updated_at,
+    }
+
+
+@app.get("/api/threads/<path:thread_key>/summary")
+@_require_api_auth
+def thread_summary_get(thread_key: str):
+    """Read endpoint for the per-thread ThreadSummary.
+
+    Cold start: 404 if no row exists. The caller (synct_utility) falls
+    back to its live LLM summarize the first time it asks; subsequent
+    polls hit the cached row here.
+
+    Disambiguation: optional ?mailbox= when the same threadKey was seen
+    in multiple connected mailboxes (rare — same conversation forwarded
+    between mailboxes). Without it, we 200 the single match, 409 on
+    ambiguity, 404 on miss."""
+    mailbox = (request.args.get("mailbox") or "").strip()
+    if mailbox:
+        ts = store.get_thread_summary(mailbox, thread_key)
+        if not ts:
+            return jsonify({"error": "not_found", "threadKey": thread_key, "mailbox": mailbox}), 404
+        return jsonify(_thread_summary_json(ts))
+    matches = store.find_thread_summaries_by_key(thread_key)
+    if not matches:
+        return jsonify({"error": "not_found", "threadKey": thread_key}), 404
+    if len(matches) > 1:
+        return jsonify({
+            "error": "ambiguous_mailbox",
+            "threadKey": thread_key,
+            "mailboxes": [m.mailbox for m in matches],
+            "hint": "pass ?mailbox=<email> to disambiguate",
+        }), 409
+    return jsonify(_thread_summary_json(matches[0]))
 
 
 @app.get("/api/decisions.json")
