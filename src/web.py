@@ -503,6 +503,162 @@ def download_db():
                      mimetype="application/x-sqlite3")
 
 
+# --- Engine status API (drives the synct "engine" visual) ------------------
+
+# Verdict bucketing: map leading digit → semantic name the synct
+# dashboard renders. v1 used `_1-CRITICAL-X` style names; v2 emits the
+# short ones (`1-Critical`). Returning BOTH a bucketed totals dict and
+# the raw per-verdict counts lets the frontend pick the shape it prefers
+# without forcing either side to migrate first.
+_VERDICT_BUCKET_BY_DIGIT = {
+    "1": "critical",
+    "2": "high",
+    "3": "personal",
+    "4": "medium",
+    "5": "low_ignore",
+}
+
+
+def _verdict_bucket(name: str) -> str:
+    for ch in (name or ""):
+        if ch.isdigit():
+            return _VERDICT_BUCKET_BY_DIGIT.get(ch, "other")
+    return "other"
+
+
+def _engine_totals(mailbox: str) -> dict:
+    """COUNT decisions by verdict_folder for one mailbox, plus a
+    digit-bucketed rollup the frontend can render as Critical/High/etc.
+    Single SQL pass — fast even on large decisions tables."""
+    with store._conn() as c:
+        rows = c.execute(
+            """SELECT verdict_folder, COUNT(*) AS n
+               FROM decisions WHERE mailbox = ?
+               GROUP BY verdict_folder""",
+            (mailbox,),
+        ).fetchall()
+    by_bucket = {k: 0 for k in
+                 ("critical", "high", "personal", "medium", "low_ignore", "other")}
+    by_verdict: dict[str, int] = {}
+    total = 0
+    for r in rows:
+        v = r["verdict_folder"] or ""
+        n = int(r["n"])
+        by_verdict[v] = n
+        by_bucket[_verdict_bucket(v)] += n
+        total += n
+    by_bucket["total"] = total
+    return {"by_bucket": by_bucket, "by_verdict": by_verdict}
+
+
+@app.get("/api/engine/mailboxes")
+@_require_api_auth
+def engine_mailboxes():
+    """List configured mailboxes — minimal shape for the synct
+    dashboard's mailbox picker. Skips IMAP server/port + notes so the
+    payload stays small."""
+    return jsonify([
+        {
+            "mailbox":    m.mailbox,
+            "provider":   m.provider,
+            "profile":    m.profile,
+            "enabled":    m.enabled,
+            "apply_mode": m.apply_mode,
+        }
+        for m in store.list_mailboxes()
+    ])
+
+
+@app.get("/api/engine/status")
+@_require_api_auth
+def engine_status():
+    """Single endpoint that feeds the synct engine visual: countdown
+    timer + per-bucket totals + status badge + the most recent N
+    decisions for the classify→tag→move animation.
+
+    `last_poll_at` is the LATER of (watermark, most recent decision
+    created_at). The watermark advances every poll cycle even when no
+    new mail arrived; the decision timestamp moves only when something
+    actually got classified. Taking the max gives the most truthful
+    "last activity" reading.
+
+    `next_poll_at` is derived (last_poll_at + poll_interval), not a
+    real schedule the poller publishes — close enough for a UI
+    countdown that rounds to the second.
+
+    `status`: 'disabled' | 'idle' | 'error'. 'error' fires when the
+    most recent decision has a non-null apply_error (a tag/move call
+    failed on Graph)."""
+    mailbox = (request.args.get("mailbox") or "").strip()
+    if not mailbox:
+        return jsonify({"error": "mailbox query param required"}), 400
+    mb = store.get_mailbox(mailbox)
+    if not mb:
+        return jsonify({"error": "unknown mailbox", "mailbox": mailbox}), 404
+
+    from datetime import datetime as _dt, timedelta, timezone as _tz
+
+    recent_limit = max(1, min(int(request.args.get("recent", "20")), 100))
+    recent_rows = store.recent_decisions(mailbox=mailbox, limit=recent_limit)
+
+    last_decision_at: _dt | None = None
+    if recent_rows:
+        try:
+            ts = recent_rows[0].created_at
+            if ts.endswith("Z"):
+                ts = ts.replace("Z", "+00:00")
+            last_decision_at = _dt.fromisoformat(ts)
+        except (ValueError, AttributeError):
+            last_decision_at = None
+
+    watermark = store.get_watermark(mailbox)
+    candidates = [t for t in (watermark, last_decision_at) if t is not None]
+    last_poll_at = max(candidates) if candidates else None
+    next_poll_at = (
+        last_poll_at + timedelta(seconds=mb.poll_interval)
+        if last_poll_at else None
+    )
+
+    if not mb.enabled:
+        status = "disabled"
+        last_error = None
+    elif recent_rows and recent_rows[0].apply_error:
+        status = "error"
+        last_error = recent_rows[0].apply_error
+    else:
+        status = "idle"
+        last_error = None
+
+    return jsonify({
+        "mailbox":               mailbox,
+        "enabled":               mb.enabled,
+        "profile":               mb.profile,
+        "apply_mode":            mb.apply_mode,
+        "status":                status,
+        "last_error":            last_error,
+        "last_poll_at":          last_poll_at.isoformat() if last_poll_at else None,
+        "next_poll_at":          next_poll_at.isoformat() if next_poll_at else None,
+        "poll_interval_seconds": mb.poll_interval,
+        "server_time":           _dt.now(_tz.utc).isoformat(),
+        "totals":                _engine_totals(mailbox),
+        "recent": [
+            {
+                "id":             d.id,
+                "created_at":     d.created_at,
+                "subject":        d.subject,
+                "sender":         d.sender,
+                "verdict_folder": d.verdict_folder,
+                "verdict_bucket": _verdict_bucket(d.verdict_folder),
+                "tagged":         d.tagged,
+                "moved":          d.moved,
+                "apply_mode":     d.apply_mode,
+                "apply_error":    d.apply_error,
+            }
+            for d in recent_rows
+        ],
+    })
+
+
 # --- ThreadSummary read API (synct now, portals later) ---------------------
 
 def _thread_summary_json(ts: ThreadSummary) -> dict:
