@@ -181,6 +181,17 @@ class Provider(ABC):
             progress.update(out)
         return out
 
+    def ensure_master_categories(self, names: list[str]) -> dict:
+        """Register tag names in the provider's master / canonical category
+        list so they show up in the client UI's category management view
+        (Outlook: Master Category List; Gmail: no equivalent — labels are
+        first-class and auto-listed). Default no-op for providers that
+        have no separate registry. Implementations should be idempotent.
+
+        Returns a dict like {'created': int, 'existed': int, 'errors': int}
+        for logging."""
+        return {"created": 0, "existed": 0, "errors": 0, "skipped": True}
+
     # Optional capabilities — providers may override for richer behavior.
 
     def supports_categories(self) -> bool:

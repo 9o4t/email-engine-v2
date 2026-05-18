@@ -34,6 +34,30 @@ log = logging.getLogger(__name__)
 
 GRAPH_API_BASE = "https://graph.microsoft.com/v1.0"
 
+
+# Outlook master-category preset colors. Mapped from the leading digit
+# of the verdict name so 1-Critical = red, 5-Low-Ignore = green, etc.
+# Matches the dashboard's verdict_class CSS buckets in web.py.
+# Preset reference: https://learn.microsoft.com/en-us/graph/api/resources/outlookcategory
+_PRESET_COLOR_BY_DIGIT = {
+    "1": "preset0",  # Red    — critical
+    "2": "preset1",  # Orange — high
+    "3": "preset8",  # Purple — personal
+    "4": "preset3",  # Yellow — medium
+    "5": "preset4",  # Green  — low / ignore
+}
+_PRESET_COLOR_FALLBACK = "preset12"  # Gray
+
+
+def _preset_color_for(name: str) -> str:
+    """First digit in the category name picks the color. Anything with no
+    digit gets gray — keeps non-conforming taxonomies functional but
+    visually distinct from the bucketed ones."""
+    for ch in name:
+        if ch.isdigit():
+            return _PRESET_COLOR_BY_DIGIT.get(ch, _PRESET_COLOR_FALLBACK)
+    return _PRESET_COLOR_FALLBACK
+
 MESSAGE_SELECT = (
     "id,conversationId,internetMessageId,subject,bodyPreview,body,from,"
     "toRecipients,ccRecipients,receivedDateTime,sentDateTime,categories,"
@@ -265,6 +289,51 @@ class GraphProvider(Provider):
     def set_categories(self, message_id: str, categories: list[str]) -> None:
         endpoint = f"{GRAPH_API_BASE}/users/{quote(self._email)}/messages/{quote(message_id, safe='')}"
         _do_json(self._broker, "PATCH", endpoint, body={"categories": categories})
+
+    def ensure_master_categories(self, names: list[str]) -> dict:
+        """Register `names` in Outlook's Master Category List so they show
+        up in the categories management UI / picker (and render with the
+        digit-mapped color, not a blank/default).
+
+        Without this, `set_categories` still works — Outlook accepts the
+        string on the message — but the category is invisible in the
+        Categories management view and rendered without a color. Master
+        list registration is a separate Graph resource.
+
+        Idempotent: GETs the existing list once, POSTs only missing
+        names. Color is auto-derived from the leading digit of the name
+        (matches the dashboard's verdict color buckets)."""
+        endpoint = (
+            f"{GRAPH_API_BASE}/users/{quote(self._email)}/outlook/masterCategories"
+        )
+        out = {"created": 0, "existed": 0, "errors": 0}
+        try:
+            data = _do_json(self._broker, "GET", endpoint) or {}
+            existing = {c.get("displayName") for c in data.get("value", [])}
+        except Exception as e:
+            log.warning("[%s] masterCategories GET failed: %s", self._email, e)
+            out["errors"] += 1
+            return out
+        for name in names:
+            if not name:
+                continue
+            if name in existing:
+                out["existed"] += 1
+                continue
+            body = {"displayName": name, "color": _preset_color_for(name)}
+            try:
+                _do_json(self._broker, "POST", endpoint, body=body)
+                out["created"] += 1
+                log.info(
+                    "[%s] registered master category %r color=%s",
+                    self._email, name, body["color"],
+                )
+            except Exception as e:
+                log.exception(
+                    "[%s] masterCategories POST %s: %s", self._email, name, e,
+                )
+                out["errors"] += 1
+        return out
 
     def move_message(self, message_id: str, dest_folder: str) -> str:
         folder_id = self.ensure_folder(dest_folder)

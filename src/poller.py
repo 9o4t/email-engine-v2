@@ -39,6 +39,12 @@ log = logging.getLogger("poller")
 
 _STOP = False
 
+# Mailboxes whose Master Category List has already been synced in this
+# process. First poll per mailbox triggers registration (GET existing +
+# POST missing); subsequent cycles skip the Graph round-trip. Restart
+# the poller to pick up taxonomy edits.
+_MASTER_CATS_SYNCED: set[str] = set()
+
 
 def _on_signal(_sig, _frame):
     global _STOP
@@ -121,8 +127,27 @@ def poll_mailbox(mb: MailboxConfig, store: Store, llm: LLMConfig) -> int:
     # when tagging. Set = leaf ids from this mailbox's taxonomy.
     # We also include the legacy v1 folder names (with the -X suffix) so
     # reclassification scrubs those off any message we re-tag.
-    rule_categories = [f["id"] or f["name"] for f in list_folders(mb.mailbox)]
+    current_categories = [f["id"] or f["name"] for f in list_folders(mb.mailbox)]
+    rule_categories = list(current_categories)
     rule_categories.extend(LEGACY_RULE_FOLDERS)
+
+    # First poll per process per mailbox: register the CURRENT taxonomy's
+    # leaf names in Outlook's Master Category List so they appear in the
+    # categories management UI with the digit-mapped color. Legacy names
+    # are intentionally NOT registered — they were retired and the user
+    # cleaned them up; we only strip them off messages, never set them.
+    if mb.mailbox not in _MASTER_CATS_SYNCED:
+        try:
+            result = provider.ensure_master_categories(current_categories)
+            _MASTER_CATS_SYNCED.add(mb.mailbox)
+            if not result.get("skipped"):
+                log.info(
+                    "[%s] master categories: created=%d existed=%d errors=%d",
+                    mb.mailbox, result.get("created", 0),
+                    result.get("existed", 0), result.get("errors", 0),
+                )
+        except Exception as e:
+            log.exception("[%s] ensure_master_categories failed: %s", mb.mailbox, e)
 
     processed = 0
     latest = watermark
