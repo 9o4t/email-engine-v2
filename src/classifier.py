@@ -241,12 +241,26 @@ def _build_pipeline(mailbox: str, base_url: str, model: str, api_key: str) -> Pi
     # + a handful of keyFacts/timeline/contacts entries. Trimming the
     # prompt is cheap relative to truncating a valid JSON mid-array,
     # which forces a re-summarize next pass.
+    #
+    # response_format=json_object: FORCES the API to return valid JSON.
+    # Without this, models heavily primed for "classify and return label"
+    # (which is most RAG-classifier deployments) ignore the JSON
+    # instruction in the system prompt and emit a bare folder name —
+    # observed in production: 5,485 / 5,485 responses were plain text
+    # before this was added, so the ThreadSummary slice never populated.
+    # Supported by Anthropic (direct + OpenAI-compat), OpenAI, OpenRouter,
+    # and most modern proxies. If a backend rejects it, the API errors
+    # loudly — better than the silent plain-text failure mode.
     generator = OpenAIGenerator(
         api_key=Secret.from_token(api_key),
         api_base_url=base_url,
         model=model,
         system_prompt=sys_prompt,
-        generation_kwargs={"temperature": 0.1, "max_tokens": 1500},
+        generation_kwargs={
+            "temperature": 0.1,
+            "max_tokens": 1500,
+            "response_format": {"type": "json_object"},
+        },
     )
 
     p = Pipeline()
