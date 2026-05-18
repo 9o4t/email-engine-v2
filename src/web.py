@@ -1063,7 +1063,7 @@ _NAV = """\
   <a href="/threads">Threads</a> ·
   <a href="/changes">Changes</a> ·
   <a href="/feedback-review">Feedback</a> ·
-  <a href="/test-email">Test</a> ·
+  <a href="/test-classify">Test</a> ·
   <a href="/mailboxes">Mailboxes</a> ·
   <a href="/admin/db.sqlite">Download DB</a> ·
   <a href="/api/feedback.csv">Feedback CSV</a> ·
@@ -2000,107 +2000,6 @@ def test_classify_run():
     )
 
 
-# --- Test email (paste a synthetic email, see what the classifier does) ---
-
-@app.get("/test-email")
-@_require_auth
-def test_email_view():
-    """Show the form for classifying a HYPOTHETICAL email — paste from,
-    subject, body, pick which mailbox's taxonomy to apply, optionally
-    override the model. No provider call, no persistence. Use when:
-      - debugging 'why did the classifier pick X for that kind of mail?'
-      - verifying a taxonomy edit before turning polling back on
-      - onboarding a new mailbox (test the taxonomy with sample mail
-        before exposing it to real volume)
-    """
-    return render_template_string(
-        _TEST_EMAIL_HTML,
-        mailboxes=store.list_mailboxes(),
-        env_model=os.getenv("LLM_MODEL", "qwen2.5:7b"),
-    )
-
-
-@app.post("/test-email/run")
-@_require_auth
-def test_email_run():
-    """Run classify() on a hand-typed email. Skips the provider entirely
-    (no real thread to fetch, no message ID to PATCH). All input comes
-    from the form. Pure dry-run — never writes to thread_summaries."""
-    from datetime import datetime as _dt, timezone as _tz
-    from classifier import LLMConfig, classify
-
-    mailbox = (request.form.get("mailbox") or "").strip()
-    sender  = (request.form.get("sender") or "").strip()
-    subject = (request.form.get("subject") or "").strip()
-    body    = (request.form.get("body") or "").strip()
-    model_override = (request.form.get("model_override") or "").strip()
-    if not mailbox:
-        abort(400, "mailbox required")
-    if not body:
-        abort(400, "body required (subject alone isn't enough context)")
-    mb = store.get_mailbox(mailbox)
-    if not mb:
-        abort(404, "unknown mailbox")
-
-    # Build the LLMConfig the same way the poller does, then layer the
-    # form's model override on top if present (so you can A/B different
-    # models on the same email without touching the mailbox config).
-    llm = LLMConfig.from_env()
-    effective_model = model_override or mb.llm_model or llm.model
-    effective_key = mb.llm_api_key or llm.api_key
-    llm = LLMConfig(base_url=llm.base_url, model=effective_model, api_key=effective_key)
-
-    # Synthetic Message-shaped values. No provider involvement.
-    synthetic_id = f"test-{int(_dt.now(_tz.utc).timestamp())}"
-    synthetic_received = _dt.now(_tz.utc)
-
-    started_at = _dt.now(_tz.utc)
-    try:
-        verdict = classify(
-            mailbox=mb.mailbox,
-            sender=sender or "(unknown@test)",
-            subject=subject,
-            body=body,
-            thread=None,           # no thread context — pure single-message test
-            prior_summary=None,    # no prior summary — cold-start every time
-            message_id=synthetic_id,
-            received_at=synthetic_received.isoformat(),
-            cfg=llm,
-        )
-    except Exception as e:
-        return Response(f"classify() raised: {e}\n\nFull traceback in poller logs.",
-                        status=502, mimetype="text/plain")
-    elapsed = (_dt.now(_tz.utc) - started_at).total_seconds()
-
-    # Build a stub "latest_msg" object for the existing result template.
-    # Namespace dance: the template reads latest_msg.subject /
-    # .from_address / .from_name — we just need an object with those
-    # attributes. A SimpleNamespace is cleanest.
-    from types import SimpleNamespace
-    latest_msg = SimpleNamespace(
-        subject=subject or "(no subject)",
-        from_address=sender,
-        from_name=sender,
-        received_at=synthetic_received,
-    )
-
-    return render_template_string(
-        _TEST_RESULT_HTML,
-        mailbox=mb.mailbox,
-        thread_key="(synthetic — no thread)",
-        conv_id="(synthetic)",
-        thread_size=1,
-        latest_msg=latest_msg,
-        used_prior_summary=False,
-        prior_summary=None,
-        verdict=verdict,
-        model_used=llm.model,
-        elapsed_seconds=elapsed,
-        persist=False,
-        persisted=False,
-    )
-
-
 # --- Feedback review + LLM taxonomy proposals -------------------------------
 
 @app.get("/feedback-review")
@@ -2396,67 +2295,6 @@ _PROPOSAL_DIFF_HTML = """\
 """
 
 
-_TEST_EMAIL_HTML = """\
-<!doctype html><title>test email — email-engine-v2</title>
-<style>
-  body { font: 14px/1.4 -apple-system, system-ui, sans-serif; margin: 1.5rem; max-width: 900px; }
-  h1 { font-size: 1.2rem; margin: 0 0 1rem; }
-  label { display: block; margin: 14px 0 4px; font-weight: 600; color: #444;
-          font-size: 0.85rem; text-transform: uppercase; letter-spacing: 0.4px; }
-  input[type=text], textarea, select {
-    width: 100%; padding: 8px 10px; font-size: 0.95rem;
-    border: 1px solid #d4d5dc; border-radius: 6px; box-sizing: border-box;
-    font-family: inherit;
-  }
-  textarea { min-height: 240px; resize: vertical; font-family: ui-monospace, monospace; font-size: 0.88rem; }
-  .row2 { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
-  button { margin-top: 18px; padding: 10px 22px; background: #5b6cff;
-           color: #fff; border: none; border-radius: 6px;
-           font-size: 0.95rem; font-weight: 600; cursor: pointer; }
-  .help { color: #666; font-size: 0.85rem; }
-  .tabs { margin: 0 0 1.5rem; font-size: 0.9rem; border-bottom: 1px solid #ddd; padding-bottom: 8px; }
-  .tabs a { margin-right: 16px; padding-bottom: 8px; text-decoration: none; color: #5b6cff; }
-  .tabs a.active { color: #222; font-weight: 600; border-bottom: 2px solid #5b6cff; }
-</style>
-""" + _DARK_MODE_CSS + _VERDICT_CSS + _NAV + """\
-<div class="tabs">
-  <a href="/test-email" class="active">Hypothetical email</a>
-  <a href="/test-classify">Replay a real thread</a>
-</div>
-
-<h1>Test the classifier on a hypothetical email</h1>
-<p class="help">Paste in a From, Subject, and Body. The classifier runs the same prompt pipeline it would in production — same taxonomy retrieval, same system prompt, same model — and shows you the parsed verdict + summary. Pure dry-run: nothing is written to the database, nothing is sent to Outlook, no thread context is invented.</p>
-
-<form method="post" action="/test-email/run">
-  <label>Mailbox <span class="help" style="text-transform:none; letter-spacing:0; font-weight:400">(determines which taxonomy + per-mailbox config is used)</span></label>
-  <select name="mailbox" required>
-    {% for m in mailboxes %}
-      <option value="{{ m.mailbox }}">{{ m.mailbox }}{% if m.llm_model %} · model: {{ m.llm_model }}{% endif %}</option>
-    {% endfor %}
-  </select>
-
-  <div class="row2">
-    <div>
-      <label>From</label>
-      <input type="text" name="sender" placeholder="alice@vendor.com" autocomplete="off">
-    </div>
-    <div>
-      <label>Model override <span class="help" style="text-transform:none; letter-spacing:0; font-weight:400">(blank = mailbox default → env default → {{ env_model }})</span></label>
-      <input type="text" name="model_override" placeholder="e.g. anthropic/claude-haiku-4-5-20251001" autocomplete="off">
-    </div>
-  </div>
-
-  <label>Subject</label>
-  <input type="text" name="subject" placeholder="Q3 renewal contract — needs signature today">
-
-  <label>Body</label>
-  <textarea name="body" required placeholder="Paste the email body here…"></textarea>
-
-  <button type="submit">↻ Run classifier</button>
-</form>
-"""
-
-
 _TEST_CLASSIFY_HTML = """\
 <!doctype html><title>test classify — email-engine-v2</title>
 <style>
@@ -2477,13 +2315,8 @@ _TEST_CLASSIFY_HTML = """\
   .preview-form label { margin-right: 12px; }
 </style>
 """ + _DARK_MODE_CSS + _VERDICT_CSS + _NAV + """\
-<div style="margin: 0 0 1.5rem; font-size: 0.9rem; border-bottom: 1px solid #ddd; padding-bottom: 8px;">
-  <a href="/test-email" style="margin-right: 16px; padding-bottom: 8px; text-decoration: none; color: #5b6cff;">Hypothetical email</a>
-  <a href="/test-classify" style="margin-right: 16px; padding-bottom: 8px; text-decoration: none; color: #222; font-weight: 600; border-bottom: 2px solid #5b6cff;">Replay a real thread</a>
-</div>
-
-<h1>Replay a real thread through the classifier</h1>
-<p class="help">Pick a real thread from your inbox history and replay it through the classifier <em>right now</em> — no waiting for new mail, no full reclassify. Pure observation by default (no DB writes). Use this after the JSON-output fix lands to verify the LLM is actually returning structured data.</p>
+<h1>Test classify</h1>
+<p class="help">Pick a real thread from your connected mailbox history and replay it through the classifier <em>right now</em> — no waiting for new mail, no full reclassify. Pure observation by default (no DB writes); tick "write summary" to also land a real thread_summaries row.</p>
 
 <form method="get" class="preview-form">
   <label>Minimum messages in thread:
