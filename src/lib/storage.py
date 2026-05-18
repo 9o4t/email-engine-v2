@@ -862,6 +862,31 @@ class Store:
                 ),
             )
 
+    def list_long_threads(
+        self, min_messages: int = 10, limit: int = 100,
+    ) -> list[dict]:
+        """Return multi-message threads across all mailboxes, longest
+        first. Drives the /test-classify picker so the operator can
+        replay a real long thread through the classifier on demand
+        instead of waiting for new mail. `min_messages` filters out
+        single-shot conversations; 10 is the typical default for
+        verifying the prior-summary cost-saving strategy."""
+        with self._conn() as c:
+            rows = c.execute(
+                """SELECT mailbox, conversation_id,
+                          COUNT(*) AS msg_count,
+                          MAX(subject) AS subject,
+                          MAX(created_at) AS last_activity
+                   FROM decisions
+                   WHERE conversation_id IS NOT NULL AND conversation_id != ''
+                   GROUP BY mailbox, conversation_id
+                   HAVING COUNT(*) >= ?
+                   ORDER BY msg_count DESC
+                   LIMIT ?""",
+                (int(min_messages), int(limit)),
+            ).fetchall()
+        return [dict(r) for r in rows]
+
     def feedback_export(
         self, mailbox: str | None = None,
         user_identifier: str | None = None,

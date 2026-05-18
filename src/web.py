@@ -1063,6 +1063,7 @@ _NAV = """\
   <a href="/threads">Threads</a> ·
   <a href="/changes">Changes</a> ·
   <a href="/feedback-review">Feedback</a> ·
+  <a href="/test-classify">Test</a> ·
   <a href="/mailboxes">Mailboxes</a> ·
   <a href="/admin/db.sqlite">Download DB</a> ·
   <a href="/api/feedback.csv">Feedback CSV</a> ·
@@ -1851,6 +1852,154 @@ _CHANGES_HTML = """\
 """
 
 
+# --- Test classify (replay a real thread through the classifier) ----------
+
+@app.get("/test-classify")
+@_require_auth
+def test_classify_view():
+    """List multi-message threads the operator can replay through the
+    classifier. Used to verify behavior (especially: 'is the JSON
+    response actually coming back?') without waiting for new mail or
+    burning a 7-day reclassify."""
+    min_msgs = int(request.args.get("min", "10"))
+    rows = store.list_long_threads(min_messages=min_msgs, limit=100)
+    return render_template_string(
+        _TEST_CLASSIFY_HTML,
+        rows=rows,
+        min_msgs=min_msgs,
+    )
+
+
+@app.post("/test-classify/run")
+@_require_auth
+def test_classify_run():
+    """Dry-run classify a single existing thread end-to-end:
+      1. Fetch the thread from the provider
+      2. Look up any prior ThreadSummary
+      3. Call classify() with the same prompt path the poller uses
+      4. Show the RAW LLM output + parsed Verdict on the result page
+
+    No DB writes (no decision row, no thread_verdict, no summary
+    upsert) — pure observation. If 'persist' checkbox is set, the
+    thread_summary IS written so you can confirm the write path works
+    end-to-end."""
+    from datetime import datetime as _dt, timezone as _tz
+    from classifier import LLMConfig, classify
+    from lib.storage import make_thread_key
+    from providers import make_provider
+
+    mailbox = (request.form.get("mailbox") or "").strip()
+    conv_id = (request.form.get("conversation_id") or "").strip()
+    persist = request.form.get("persist") == "1"
+    if not mailbox or not conv_id:
+        abort(400, "mailbox + conversation_id required")
+    mb = store.get_mailbox(mailbox)
+    if not mb:
+        abort(404, "unknown mailbox")
+
+    provider = make_provider(
+        mb.mailbox, mb.provider,
+        imap_server=mb.imap_server, imap_port=mb.imap_port,
+    )
+
+    try:
+        thread = provider.get_thread(conv_id)
+    except Exception as e:
+        return Response(f"provider.get_thread failed: {e}",
+                        status=502, mimetype="text/plain")
+    if not thread:
+        abort(404, "thread not found in provider (it may have been deleted or moved)")
+
+    latest_msg = max(
+        thread,
+        key=lambda x: x.received_at or _dt.min.replace(tzinfo=_tz.utc),
+    )
+    thread_ctx = [
+        {
+            "sender": tm.from_address or tm.from_name or "(unknown)",
+            "received": tm.received_at.isoformat() if tm.received_at else "",
+            "body": (tm.body_text or "")[:1500],
+        }
+        for tm in thread
+        if tm.id != latest_msg.id
+    ]
+
+    thread_key = make_thread_key(mb.provider, conv_id)
+    prior_summary_dict = None
+    prior_ts_row = store.get_thread_summary(mb.mailbox, thread_key) if thread_key else None
+    if prior_ts_row:
+        prior_summary_dict = {
+            "summary":       prior_ts_row.summary,
+            "key_facts":     prior_ts_row.key_facts,
+            "timeline":      prior_ts_row.timeline,
+            "contacts":      prior_ts_row.contacts,
+            "message_count": prior_ts_row.message_count,
+        }
+
+    # Per-mailbox LLM override (matches what the poller does live).
+    llm = LLMConfig.from_env()
+    if mb.llm_model or mb.llm_api_key:
+        llm = LLMConfig(
+            base_url=llm.base_url,
+            model=mb.llm_model or llm.model,
+            api_key=mb.llm_api_key or llm.api_key,
+        )
+
+    started_at = _dt.now(_tz.utc)
+    try:
+        verdict = classify(
+            mailbox=mb.mailbox,
+            sender=latest_msg.from_address or latest_msg.from_name,
+            subject=latest_msg.subject,
+            body=latest_msg.body_text,
+            thread=thread_ctx if prior_summary_dict is None else None,
+            prior_summary=prior_summary_dict,
+            message_id=latest_msg.id,
+            received_at=latest_msg.received_at.isoformat() if latest_msg.received_at else None,
+            cfg=llm,
+        )
+    except Exception as e:
+        return Response(f"classify() raised: {e}\n\nFull traceback in poller logs.",
+                        status=502, mimetype="text/plain")
+    elapsed = (_dt.now(_tz.utc) - started_at).total_seconds()
+
+    persisted = False
+    if persist and thread_key:
+        try:
+            store.upsert_thread_summary(
+                mailbox=mb.mailbox,
+                thread_key=thread_key,
+                summary=verdict.summary,
+                key_facts=verdict.key_facts,
+                timeline=verdict.timeline,
+                contacts=verdict.contacts,
+                last_message_id=latest_msg.id,
+                last_message_at=(latest_msg.received_at.isoformat()
+                                 if latest_msg.received_at else None),
+                message_count=len(thread),
+                status="errored" if verdict.parse_error else "fresh",
+            )
+            persisted = True
+        except Exception as e:
+            log.exception("test-classify persist failed: %s", e)
+
+    return render_template_string(
+        _TEST_RESULT_HTML,
+        mailbox=mb.mailbox,
+        thread_key=thread_key,
+        conv_id=conv_id,
+        thread_size=len(thread),
+        latest_msg=latest_msg,
+        used_prior_summary=prior_summary_dict is not None,
+        prior_summary=prior_summary_dict,
+        verdict=verdict,
+        model_used=llm.model,
+        elapsed_seconds=elapsed,
+        persist=persist,
+        persisted=persisted,
+    )
+
+
 # --- Feedback review + LLM taxonomy proposals -------------------------------
 
 @app.get("/feedback-review")
@@ -2143,6 +2292,178 @@ _PROPOSAL_DIFF_HTML = """\
     <pre>{{ p.proposed_json }}</pre>
   </div>
 </div>
+"""
+
+
+_TEST_CLASSIFY_HTML = """\
+<!doctype html><title>test classify — email-engine-v2</title>
+<style>
+  body { font: 14px/1.4 -apple-system, system-ui, sans-serif; margin: 1.5rem; max-width: 1100px; }
+  h1 { font-size: 1.2rem; margin: 0 0 1rem; }
+  table { border-collapse: collapse; width: 100%; }
+  th, td { padding: 6px 8px; border-bottom: 1px solid #eee; vertical-align: top; font-size: 0.88rem; }
+  th { text-align: left; background: #fafafa; }
+  .help { color: #666; font-size: 0.85rem; }
+  .when { color: #777; font-size: 0.8rem; white-space: nowrap; }
+  .subj { font-weight: 600; }
+  button { padding: 4px 10px; font-size: 0.85rem; cursor: pointer; }
+  .test-btn { background: #5b6cff; color: #fff; border: none; border-radius: 3px; }
+  .conv-tail { color: #999; font-family: ui-monospace, monospace; font-size: 0.75rem; }
+  .preview-form { margin-top: 0; padding: 8px 12px; background: #fffaf0;
+                  border-left: 3px solid #d4a82a; border-radius: 3px;
+                  font-size: 0.9rem; margin-bottom: 1rem; }
+  .preview-form label { margin-right: 12px; }
+</style>
+""" + _DARK_MODE_CSS + _VERDICT_CSS + _NAV + """\
+<h1>Test classify</h1>
+<p class="help">Pick a real thread from your inbox history and replay it through the classifier <em>right now</em> — no waiting for new mail, no full reclassify. Pure observation by default (no DB writes). Use this after the JSON-output fix lands to verify the LLM is actually returning structured data.</p>
+
+<form method="get" class="preview-form">
+  <label>Minimum messages in thread:
+    <input type="number" name="min" value="{{ min_msgs }}" min="2" max="500" style="width: 70px"
+           onchange="this.form.submit()">
+  </label>
+  <span class="help">{{ rows|length }} thread(s) shown</span>
+</form>
+
+<table>
+  <thead><tr>
+    <th>Mailbox</th><th>Subject</th><th># msgs</th><th>Last activity</th><th></th>
+  </tr></thead>
+  <tbody>
+  {% for r in rows %}
+    <tr>
+      <td>{{ r.mailbox }}</td>
+      <td>
+        <div class="subj">{{ (r.subject or '(no subject)')[:90] }}</div>
+        <div class="conv-tail">{{ r.conversation_id[-12:] }}</div>
+      </td>
+      <td>{{ r.msg_count }}</td>
+      <td class="when">{{ r.last_activity[:19].replace('T',' ') if r.last_activity else '' }}</td>
+      <td>
+        <form method="post" action="/test-classify/run" style="display:inline-flex; gap: 6px; align-items: center;">
+          <input type="hidden" name="mailbox" value="{{ r.mailbox }}">
+          <input type="hidden" name="conversation_id" value="{{ r.conversation_id }}">
+          <label class="help" style="display:inline-flex; gap: 4px; align-items: center;">
+            <input type="checkbox" name="persist" value="1"> write summary
+          </label>
+          <button type="submit" class="test-btn">↻ Test classify</button>
+        </form>
+      </td>
+    </tr>
+  {% endfor %}
+  </tbody>
+</table>
+"""
+
+
+_TEST_RESULT_HTML = """\
+<!doctype html><title>test result — email-engine-v2</title>
+<style>
+  body { font: 14px/1.45 -apple-system, system-ui, sans-serif; margin: 1.5rem; max-width: 1100px; }
+  h1, h2 { font-size: 1.1rem; }
+  pre { background: #f5f5f8; padding: 10px 12px; border-radius: 6px;
+        white-space: pre-wrap; word-break: break-word; font-size: 0.85rem;
+        line-height: 1.4; max-height: 480px; overflow: auto; }
+  .meta { background: #f3f4f8; padding: 10px 14px; border-radius: 6px;
+          margin-bottom: 18px; font-size: 0.9rem; }
+  .meta dt { font-weight: 600; margin-top: 4px; }
+  .meta dd { margin: 0 0 4px 0; color: #444; }
+  .ok   { color: #196b3a; font-weight: 600; }
+  .fail { color: #b32626; font-weight: 600; }
+  .help { color: #666; font-size: 0.85rem; }
+  table.kv { border-collapse: collapse; width: 100%; margin: 8px 0; }
+  table.kv th, table.kv td { padding: 5px 8px; border-bottom: 1px solid #eee;
+                              vertical-align: top; font-size: 0.85rem; text-align: left; }
+  table.kv th { background: #fafafa; font-weight: 600; }
+  .banner { padding: 10px 14px; border-radius: 6px; margin-bottom: 16px; font-weight: 600; }
+  .banner.ok   { background: #e8f8ee; color: #196b3a; border-left: 4px solid #2bb24c; }
+  .banner.fail { background: #fde0e0; color: #b32626; border-left: 4px solid #d84545; }
+</style>
+""" + _DARK_MODE_CSS + _VERDICT_CSS + _NAV + """\
+<h1>Test classify result</h1>
+
+{% if verdict.parse_error %}
+<div class="banner fail">
+  ✗ LLM did not return JSON. parse_error: <code>{{ verdict.parse_error }}</code><br>
+  <span class="help" style="font-weight: 400;">→ The response_format=json_object fix is either not deployed yet, or the backend ignored it. Check raw output below.</span>
+</div>
+{% elif verdict.summary %}
+<div class="banner ok">
+  ✓ LLM returned valid JSON with a summary ({{ verdict.summary|length }} chars).
+  This is the cost-saving strategy working as designed.
+</div>
+{% else %}
+<div class="banner fail">
+  ⚠ LLM returned JSON but the summary field was empty. Folder verdict still works; cost-saving doesn't kick in.
+</div>
+{% endif %}
+
+<div class="meta">
+  <dl>
+    <dt>Mailbox</dt>           <dd>{{ mailbox }}</dd>
+    <dt>Thread key</dt>        <dd><code>{{ thread_key }}</code></dd>
+    <dt>Conversation id</dt>   <dd><code>{{ conv_id }}</code></dd>
+    <dt>Thread size</dt>       <dd>{{ thread_size }} message(s) fetched from provider</dd>
+    <dt>Latest message</dt>    <dd>{{ latest_msg.subject or '(no subject)' }} — from {{ latest_msg.from_address or latest_msg.from_name }}</dd>
+    <dt>Prior summary used?</dt><dd>{% if used_prior_summary %}<span class="ok">YES</span> — cost-saving path active (full thread NOT re-sent){% else %}<span class="fail">NO</span> — first classification of this thread, full thread context sent{% endif %}</dd>
+    <dt>Model</dt>             <dd><code>{{ model_used }}</code></dd>
+    <dt>Elapsed</dt>           <dd>{{ '%.2f'|format(elapsed_seconds) }}s</dd>
+    {% if persist %}
+      <dt>Persisted to thread_summaries?</dt>
+      <dd>{% if persisted %}<span class="ok">YES</span> — summary row written{% else %}<span class="fail">NO</span> — write failed (see logs){% endif %}</dd>
+    {% else %}
+      <dt>Persisted?</dt><dd>No — dry-run mode (no DB writes)</dd>
+    {% endif %}
+  </dl>
+</div>
+
+<h2>Parsed verdict</h2>
+<table class="kv">
+  <tr><th>folder</th><td><span class="verdict {{ verdict.folder | verdict_class }}">{{ verdict.folder }}</span></td></tr>
+  <tr><th>summary</th><td>{{ verdict.summary or '(empty)' }}</td></tr>
+  <tr><th>keyFacts ({{ verdict.key_facts|length }})</th><td>
+    {% if verdict.key_facts %}
+      <ul style="margin:0; padding-left: 18px;">
+      {% for kf in verdict.key_facts %}
+        <li><strong>{{ kf.label }}:</strong> {{ kf.value }}</li>
+      {% endfor %}
+      </ul>
+    {% else %}<span class="help">(empty)</span>{% endif %}
+  </td></tr>
+  <tr><th>timeline ({{ verdict.timeline|length }})</th><td>
+    {% if verdict.timeline %}
+      <ul style="margin:0; padding-left: 18px;">
+      {% for ev in verdict.timeline %}
+        <li><code>{{ ev.date }}</code> — {{ ev.event }}</li>
+      {% endfor %}
+      </ul>
+    {% else %}<span class="help">(empty)</span>{% endif %}
+  </td></tr>
+  <tr><th>contacts ({{ verdict.contacts|length }})</th><td>
+    {% if verdict.contacts %}
+      <ul style="margin:0; padding-left: 18px;">
+      {% for c in verdict.contacts %}
+        <li><strong>{{ c.name or '(unknown)' }}</strong>
+          {% if c.email %}&lt;{{ c.email }}&gt;{% endif %}
+          {% if c.role %} · {{ c.role }}{% endif %}
+          {% if c.organization %} · {{ c.organization }}{% endif %}</li>
+      {% endfor %}
+      </ul>
+    {% else %}<span class="help">(empty)</span>{% endif %}
+  </td></tr>
+</table>
+
+<h2>Raw LLM output</h2>
+<p class="help">Should start with <code>{</code> if the JSON-output fix is working. Plain folder names like <code>4-Medium</code> mean the LLM still isn't producing JSON.</p>
+<pre>{{ verdict.raw }}</pre>
+
+{% if prior_summary %}
+<h2>Prior summary (what we fed the LLM)</h2>
+<pre>{{ prior_summary | tojson(indent=2) }}</pre>
+{% endif %}
+
+<p><a href="/test-classify">← back to thread list</a></p>
 """
 
 
