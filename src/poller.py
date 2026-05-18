@@ -253,14 +253,24 @@ def _classify_thread_and_apply(
     # context — never both). When a prior summary exists it IS the
     # compressed thread context, so we skip the per-message context.
     #
-    # Per-mailbox model override: if mb.llm_model is set, use it instead
-    # of LLM_MODEL env default. Same provider (base_url + api_key from
-    # env), different model — lets you run Haiku on a cost-sensitive
-    # mailbox while keeping Opus on your own.
-    mailbox_llm = (
-        LLMConfig(base_url=llm.base_url, model=mb.llm_model, api_key=llm.api_key)
-        if mb.llm_model else llm
-    )
+    # Per-mailbox LLM overrides. Each field independently overrides its
+    # env default:
+    #   - mb.llm_model   → different model (Haiku for the cost-sensitive
+    #                      mailbox, Opus for yours)
+    #   - mb.llm_api_key → different API key (one key per executive's
+    #                      mailbox so cost attribution per inbox shows
+    #                      up cleanly in the provider dashboard)
+    # If any override is set, build a fresh LLMConfig; otherwise pass
+    # the shared one straight through (cheaper — no extra allocation
+    # per classification).
+    if mb.llm_model or mb.llm_api_key:
+        mailbox_llm = LLMConfig(
+            base_url=llm.base_url,
+            model=mb.llm_model or llm.model,
+            api_key=mb.llm_api_key or llm.api_key,
+        )
+    else:
+        mailbox_llm = llm
     verdict = classify(
         mailbox=mb.mailbox,
         sender=latest_msg.from_address or latest_msg.from_name,

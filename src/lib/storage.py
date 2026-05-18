@@ -44,11 +44,15 @@ CREATE TABLE IF NOT EXISTS mailbox_config (
     --              (your taxonomy reflects YOUR preferences, not delegates')
     -- 'shared'   = workflow mailbox (quotes@/orders@/helpdesk@); feedback
     --              pooled across everyone who triages it
-    llm_model      TEXT                                -- per-mailbox model override
+    llm_model      TEXT,                               -- per-mailbox model override
     -- NULL = use the LLM_MODEL env default. Set to e.g. 'claude-haiku-4-5'
     -- on a cost-sensitive mailbox while keeping Opus for the executive's
-    -- own inbox. Only the model name varies; base_url + api_key still come
-    -- from env (same provider, different model).
+    -- own inbox.
+    llm_api_key    TEXT                                -- per-mailbox API key override
+    -- NULL = use the LLM_API_KEY env default. Set to a dedicated key per
+    -- inbox so cost shows up per key in the provider dashboard (e.g.,
+    -- separate Anthropic API keys for each executive's mailbox so you
+    -- can attribute spend cleanly).
 );
 
 CREATE TABLE IF NOT EXISTS watermarks (
@@ -212,7 +216,8 @@ class MailboxConfig:
     poll_interval: int
     notes: str
     profile: str = "personal"
-    llm_model: str | None = None  # None = use LLM_MODEL env default
+    llm_model: str | None = None    # None = use LLM_MODEL env default
+    llm_api_key: str | None = None  # None = use LLM_API_KEY env default
 
 
 @dataclass
@@ -291,6 +296,7 @@ class Store:
         adds = [
             ("mailbox_config", "profile",         "TEXT NOT NULL DEFAULT 'personal'"),
             ("mailbox_config", "llm_model",       "TEXT"),
+            ("mailbox_config", "llm_api_key",     "TEXT"),
             ("feedback",       "user_identifier", "TEXT"),
         ]
         for table, col, decl in adds:
@@ -323,8 +329,8 @@ class Store:
             c.execute(
                 """INSERT INTO mailbox_config
                    (mailbox, provider, apply_mode, enabled, imap_server, imap_port,
-                    poll_interval, notes, profile, llm_model)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    poll_interval, notes, profile, llm_model, llm_api_key)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                    ON CONFLICT(mailbox) DO UPDATE SET
                      provider=excluded.provider,
                      apply_mode=excluded.apply_mode,
@@ -334,12 +340,14 @@ class Store:
                      poll_interval=excluded.poll_interval,
                      notes=excluded.notes,
                      profile=excluded.profile,
-                     llm_model=excluded.llm_model""",
+                     llm_model=excluded.llm_model,
+                     llm_api_key=excluded.llm_api_key""",
                 (
                     mb.mailbox, mb.provider, mb.apply_mode, 1 if mb.enabled else 0,
                     mb.imap_server, mb.imap_port, mb.poll_interval, mb.notes,
                     mb.profile or "personal",
                     (mb.llm_model or "").strip() or None,
+                    (mb.llm_api_key or "").strip() or None,
                 ),
             )
 
@@ -918,6 +926,10 @@ def _row_to_mailbox(r: sqlite3.Row) -> MailboxConfig:
         llm_model = r["llm_model"] or None
     except (IndexError, KeyError):
         llm_model = None
+    try:
+        llm_api_key = r["llm_api_key"] or None
+    except (IndexError, KeyError):
+        llm_api_key = None
     return MailboxConfig(
         mailbox=r["mailbox"],
         provider=r["provider"],
@@ -929,6 +941,7 @@ def _row_to_mailbox(r: sqlite3.Row) -> MailboxConfig:
         notes=r["notes"],
         profile=profile,
         llm_model=llm_model,
+        llm_api_key=llm_api_key,
     )
 
 

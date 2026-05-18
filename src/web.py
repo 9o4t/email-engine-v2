@@ -56,6 +56,20 @@ def _current_user(default: str | None = None) -> str:
     return val or (default or "")
 
 
+def _api_key_mask(v: str | None) -> str:
+    """Render '(not set)' when null/empty, else '(set: ...XXXX)' showing
+    just the last 4 chars. Operators can verify the right key is in
+    place without exposing the secret in HTML. The Basic-auth dashboard
+    already gates access — last 4 leaks are an acceptable tradeoff for
+    'did I paste the wrong key?' confirmability."""
+    if not v:
+        return "(not set — uses LLM_API_KEY env)"
+    s = str(v).strip()
+    if len(s) <= 4:
+        return "(set: ****)"
+    return f"(set: …{s[-4:]})"
+
+
 log = logging.getLogger(__name__)
 
 
@@ -84,6 +98,11 @@ def verdict_class(v: str | None) -> str:
         if c.isdigit():
             return f"v{c}"
     return "vu"
+
+
+@app.template_filter("api_key_mask")
+def api_key_mask_filter(v: str | None) -> str:
+    return _api_key_mask(v)
 
 
 # --- Auth -------------------------------------------------------------------
@@ -757,6 +776,7 @@ def mailboxes_add():
         notes=request.form.get("notes", "").strip(),
         profile=profile,
         llm_model=(request.form.get("llm_model", "").strip() or None),
+        llm_api_key=(request.form.get("llm_api_key", "").strip() or None),
     )
     if not mb.mailbox:
         abort(400, "mailbox required")
@@ -788,6 +808,18 @@ def mailboxes_update(email: str):
     # "field missing from form" (which preserves the current value).
     if "llm_model" in request.form:
         cur.llm_model = (request.form.get("llm_model") or "").strip() or None
+    # llm_api_key (3-state):
+    #   - `clear_api_key=1` checkbox → clear back to env default
+    #   - non-empty input value      → set the new key
+    #   - empty input + no checkbox  → preserve (lets the user save the
+    #     row without re-entering the secret every time, since the input
+    #     is always rendered empty for security)
+    if request.form.get("clear_api_key") == "1":
+        cur.llm_api_key = None
+    else:
+        new_key = (request.form.get("llm_api_key") or "").strip()
+        if new_key:
+            cur.llm_api_key = new_key
     if cur.apply_mode not in APPLY_MODES:
         abort(400, f"apply_mode must be one of {APPLY_MODES}")
     store.upsert_mailbox(cur)
@@ -1267,7 +1299,7 @@ _MAILBOXES_HTML = """\
 <table>
   <thead><tr>
     <th>Mailbox</th><th>Provider</th><th>Profile</th><th>Apply mode</th>
-    <th>State</th><th>Model</th>
+    <th>State</th><th>Model</th><th>API key</th>
     <th>IMAP server:port</th><th>Poll interval</th><th>Actions</th>
   </tr></thead>
   <tbody>
@@ -1310,6 +1342,17 @@ _MAILBOXES_HTML = """\
                title="Per-mailbox model override. Empty = use LLM_MODEL env default ({{ env_model }}). Set to e.g. 'claude-haiku-4-5' to save cost on a less-critical mailbox.">
       </td>
       <td>
+        <div class="help" style="font-family: ui-monospace, monospace; margin-bottom: 4px;">
+          {{ m.llm_api_key | api_key_mask }}
+        </div>
+        <input type="password" name="llm_api_key" value=""
+               placeholder="paste new key to replace…" size="20" autocomplete="off"
+               title="Per-mailbox API key. Submitting empty preserves the current value (so you don't have to retype on every Save). Paste a new key to replace; tick the clear box below to remove it.">
+        <label style="font-size: 0.78rem; color: #666; display: block; margin-top: 2px;">
+          <input type="checkbox" name="clear_api_key" value="1"> clear → use env default
+        </label>
+      </td>
+      <td>
         {% if m.provider == 'imap' %}
           <input type="text" name="imap_server" value="{{ m.imap_server }}" size="20">
           :<input type="number" name="imap_port" value="{{ m.imap_port }}" size="5" style="width:60px">
@@ -1326,7 +1369,7 @@ _MAILBOXES_HTML = """\
     </tr>
     </form>
     <tr>
-      <td colspan="9" style="border-bottom: 2px solid #f0f0f0; padding-bottom: 12px;">
+      <td colspan="10" style="border-bottom: 2px solid #f0f0f0; padding-bottom: 12px;">
         <form method="post" action="/mailboxes/{{ m.mailbox }}/reclassify" style="display:inline-flex; gap:6px; align-items:center; flex-wrap:wrap;"
               id="reclass-form-{{ m.mailbox }}"
               onsubmit="return confirm('Reclassify {{ m.mailbox }}? Scope: ' + (document.getElementById('days-{{ m.mailbox }}').value ? 'last ' + document.getElementById('days-{{ m.mailbox }}').value + ' day(s)' : 'ALL history') + '. Walks INBOX plus every legacy …-X folder, newest first.')">
@@ -1409,6 +1452,8 @@ _MAILBOXES_HTML = """\
   </label>
   <label>Model <input type="text" name="llm_model" placeholder="{{ env_model }}" size="22"
                      title="Optional per-mailbox model override. Blank = use LLM_MODEL env default ({{ env_model }})."></label>
+  <label>API key <input type="password" name="llm_api_key" placeholder="(blank = LLM_API_KEY env)" size="22" autocomplete="off"
+                       title="Optional per-mailbox API key. Useful for cost attribution per inbox in the provider dashboard."></label>
   <br><br>
   <label>IMAP server <input type="text" name="imap_server" size="20" value="imap.gmail.com"></label>
   <label>Port <input type="number" name="imap_port" value="993" style="width:60px"></label>
