@@ -39,11 +39,16 @@ CREATE TABLE IF NOT EXISTS mailbox_config (
     imap_port      INTEGER NOT NULL DEFAULT 993,
     poll_interval  INTEGER NOT NULL DEFAULT 30,   -- seconds
     notes          TEXT NOT NULL DEFAULT '',
-    profile        TEXT NOT NULL DEFAULT 'personal'  -- 'personal' | 'shared'
+    profile        TEXT NOT NULL DEFAULT 'personal',  -- 'personal' | 'shared'
     -- 'personal' = one human's mailbox; feedback + proposals scoped per user
     --              (your taxonomy reflects YOUR preferences, not delegates')
     -- 'shared'   = workflow mailbox (quotes@/orders@/helpdesk@); feedback
     --              pooled across everyone who triages it
+    llm_model      TEXT                                -- per-mailbox model override
+    -- NULL = use the LLM_MODEL env default. Set to e.g. 'claude-haiku-4-5'
+    -- on a cost-sensitive mailbox while keeping Opus for the executive's
+    -- own inbox. Only the model name varies; base_url + api_key still come
+    -- from env (same provider, different model).
 );
 
 CREATE TABLE IF NOT EXISTS watermarks (
@@ -207,6 +212,7 @@ class MailboxConfig:
     poll_interval: int
     notes: str
     profile: str = "personal"
+    llm_model: str | None = None  # None = use LLM_MODEL env default
 
 
 @dataclass
@@ -284,6 +290,7 @@ class Store:
     def _apply_additive_migrations(c: sqlite3.Connection) -> None:
         adds = [
             ("mailbox_config", "profile",         "TEXT NOT NULL DEFAULT 'personal'"),
+            ("mailbox_config", "llm_model",       "TEXT"),
             ("feedback",       "user_identifier", "TEXT"),
         ]
         for table, col, decl in adds:
@@ -316,8 +323,8 @@ class Store:
             c.execute(
                 """INSERT INTO mailbox_config
                    (mailbox, provider, apply_mode, enabled, imap_server, imap_port,
-                    poll_interval, notes, profile)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    poll_interval, notes, profile, llm_model)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                    ON CONFLICT(mailbox) DO UPDATE SET
                      provider=excluded.provider,
                      apply_mode=excluded.apply_mode,
@@ -326,13 +333,36 @@ class Store:
                      imap_port=excluded.imap_port,
                      poll_interval=excluded.poll_interval,
                      notes=excluded.notes,
-                     profile=excluded.profile""",
+                     profile=excluded.profile,
+                     llm_model=excluded.llm_model""",
                 (
                     mb.mailbox, mb.provider, mb.apply_mode, 1 if mb.enabled else 0,
                     mb.imap_server, mb.imap_port, mb.poll_interval, mb.notes,
                     mb.profile or "personal",
+                    (mb.llm_model or "").strip() or None,
                 ),
             )
+
+    def set_mailbox_enabled(self, mailbox: str, enabled: bool) -> int:
+        """One-shot pause/resume — flips just the enabled flag, no other
+        fields touched. Returns the number of rows updated (1 = success,
+        0 = unknown mailbox)."""
+        with self._conn() as c:
+            cur = c.execute(
+                "UPDATE mailbox_config SET enabled = ? WHERE mailbox = ?",
+                (1 if enabled else 0, mailbox),
+            )
+        return cur.rowcount
+
+    def set_all_mailboxes_enabled(self, enabled: bool) -> int:
+        """Bulk pause/resume — the 'panic button' for runaway LLM cost.
+        Returns the number of rows updated."""
+        with self._conn() as c:
+            cur = c.execute(
+                "UPDATE mailbox_config SET enabled = ?",
+                (1 if enabled else 0,),
+            )
+        return cur.rowcount
 
     def list_mailboxes(self) -> list[MailboxConfig]:
         with self._conn() as c:
@@ -884,6 +914,10 @@ def _row_to_mailbox(r: sqlite3.Row) -> MailboxConfig:
         profile = r["profile"] or "personal"
     except (IndexError, KeyError):
         profile = "personal"
+    try:
+        llm_model = r["llm_model"] or None
+    except (IndexError, KeyError):
+        llm_model = None
     return MailboxConfig(
         mailbox=r["mailbox"],
         provider=r["provider"],
@@ -894,6 +928,7 @@ def _row_to_mailbox(r: sqlite3.Row) -> MailboxConfig:
         poll_interval=r["poll_interval"],
         notes=r["notes"],
         profile=profile,
+        llm_model=llm_model,
     )
 
 

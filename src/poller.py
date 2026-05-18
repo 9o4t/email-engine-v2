@@ -252,6 +252,15 @@ def _classify_thread_and_apply(
     # 3b. Classify based on the latest message + (prior summary OR thread
     # context — never both). When a prior summary exists it IS the
     # compressed thread context, so we skip the per-message context.
+    #
+    # Per-mailbox model override: if mb.llm_model is set, use it instead
+    # of LLM_MODEL env default. Same provider (base_url + api_key from
+    # env), different model — lets you run Haiku on a cost-sensitive
+    # mailbox while keeping Opus on your own.
+    mailbox_llm = (
+        LLMConfig(base_url=llm.base_url, model=mb.llm_model, api_key=llm.api_key)
+        if mb.llm_model else llm
+    )
     verdict = classify(
         mailbox=mb.mailbox,
         sender=latest_msg.from_address or latest_msg.from_name,
@@ -261,7 +270,7 @@ def _classify_thread_and_apply(
         prior_summary=prior_summary,
         message_id=latest_msg.id,
         received_at=latest_msg.received_at.isoformat() if latest_msg.received_at else None,
-        cfg=llm,
+        cfg=mailbox_llm,
     )
     folder_name = verdict.folder
 

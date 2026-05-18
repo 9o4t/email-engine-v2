@@ -736,6 +736,7 @@ def mailboxes_list():
         mailboxes=store.list_mailboxes(),
         apply_modes=APPLY_MODES,
         profiles=MAILBOX_PROFILES,
+        env_model=os.getenv("LLM_MODEL", "qwen2.5:7b"),
     )
 
 
@@ -755,6 +756,7 @@ def mailboxes_add():
         poll_interval=int(request.form.get("poll_interval", "30")),
         notes=request.form.get("notes", "").strip(),
         profile=profile,
+        llm_model=(request.form.get("llm_model", "").strip() or None),
     )
     if not mb.mailbox:
         abort(400, "mailbox required")
@@ -782,6 +784,10 @@ def mailboxes_update(email: str):
     if new_profile and new_profile not in MAILBOX_PROFILES:
         abort(400, f"profile must be one of {MAILBOX_PROFILES}")
     cur.profile = new_profile or cur.profile
+    # llm_model: empty string → clear back to env default. Distinct from
+    # "field missing from form" (which preserves the current value).
+    if "llm_model" in request.form:
+        cur.llm_model = (request.form.get("llm_model") or "").strip() or None
     if cur.apply_mode not in APPLY_MODES:
         abort(400, f"apply_mode must be one of {APPLY_MODES}")
     store.upsert_mailbox(cur)
@@ -793,6 +799,42 @@ def mailboxes_update(email: str):
 def mailboxes_delete(email: str):
     store.delete_mailbox(email)
     return Response(status=303, headers={"Location": "/mailboxes"})
+
+
+@app.post("/mailboxes/<path:email>/pause")
+@_require_auth
+def mailboxes_pause(email: str):
+    """One-click pause: flips enabled=0 on this mailbox. Polling stops
+    next cycle (≤30s typical). Use to halt LLM cost on a specific
+    mailbox without losing its config."""
+    if store.set_mailbox_enabled(email, False) == 0:
+        abort(404, "unknown mailbox")
+    return Response(status=303, headers={"Location": "/mailboxes?msg=paused"})
+
+
+@app.post("/mailboxes/<path:email>/resume")
+@_require_auth
+def mailboxes_resume(email: str):
+    if store.set_mailbox_enabled(email, True) == 0:
+        abort(404, "unknown mailbox")
+    return Response(status=303, headers={"Location": "/mailboxes?msg=resumed"})
+
+
+@app.post("/mailboxes/pause-all")
+@_require_auth
+def mailboxes_pause_all():
+    """Panic button: pauses every mailbox at once. Use when you spot
+    runaway cost in your LLM dashboard and want to stop the bleeding
+    before debugging which mailbox is responsible."""
+    n = store.set_all_mailboxes_enabled(False)
+    return Response(status=303, headers={"Location": f"/mailboxes?msg=paused-all&n={n}"})
+
+
+@app.post("/mailboxes/resume-all")
+@_require_auth
+def mailboxes_resume_all():
+    n = store.set_all_mailboxes_enabled(True)
+    return Response(status=303, headers={"Location": f"/mailboxes?msg=resumed-all&n={n}"})
 
 
 @app.post("/mailboxes/<path:email>/reclassify")
@@ -1199,12 +1241,33 @@ _MAILBOXES_HTML = """\
   <div class="banner ok">Sweep started — moving messages from the requested folder to Inbox in a background thread.</div>
 {% elif request.args.get('msg') == 'sweep-already-running' %}
   <div class="banner">A sweep is already in flight for that mailbox — second click ignored.</div>
+{% elif request.args.get('msg') == 'paused' %}
+  <div class="banner">Mailbox paused. Polling stops on the next cycle (≤30s). Resume any time.</div>
+{% elif request.args.get('msg') == 'resumed' %}
+  <div class="banner ok">Mailbox resumed. Next poll cycle will pick it back up.</div>
+{% elif request.args.get('msg') == 'paused-all' %}
+  <div class="banner">Paused {{ request.args.get('n', '?') }} mailbox(es). All polling stops next cycle.</div>
+{% elif request.args.get('msg') == 'resumed-all' %}
+  <div class="banner ok">Resumed {{ request.args.get('n', '?') }} mailbox(es).</div>
 {% endif %}
 <h1>Mailboxes</h1>
 
+<div style="margin-bottom: 1rem; display: flex; gap: 8px; align-items: center;">
+  <form method="post" action="/mailboxes/pause-all" style="display:inline"
+        onsubmit="return confirm('Pause ALL mailboxes? Polling stops on every mailbox next cycle. Use this for runaway LLM cost.')">
+    <button type="submit" style="background: #d84545; color: #fff; border: none; padding: 6px 14px; border-radius: 4px; font-weight: 600;">⏸ Pause all</button>
+  </form>
+  <form method="post" action="/mailboxes/resume-all" style="display:inline"
+        onsubmit="return confirm('Resume ALL mailboxes?')">
+    <button type="submit" style="background: #2bb24c; color: #fff; border: none; padding: 6px 14px; border-radius: 4px; font-weight: 600;">▶ Resume all</button>
+  </form>
+  <span class="help" style="margin-left: 8px;">Panic button — pauses every mailbox. Use when LLM cost spikes; each mailbox's config is preserved.</span>
+</div>
+
 <table>
   <thead><tr>
-    <th>Mailbox</th><th>Provider</th><th>Profile</th><th>Apply mode</th><th>Enabled</th>
+    <th>Mailbox</th><th>Provider</th><th>Profile</th><th>Apply mode</th>
+    <th>State</th><th>Model</th>
     <th>IMAP server:port</th><th>Poll interval</th><th>Actions</th>
   </tr></thead>
   <tbody>
@@ -1231,10 +1294,20 @@ _MAILBOXES_HTML = """\
         </select>
       </td>
       <td>
-        <select name="enabled">
-          <option value="1" {% if m.enabled %}selected{% endif %}>yes</option>
-          <option value="0" {% if not m.enabled %}selected{% endif %}>no</option>
-        </select>
+        {# Keep enabled in the form so the Save button doesn't accidentally
+           re-enable a paused mailbox. The one-click pause/resume buttons
+           below are the recommended way to flip state. #}
+        <input type="hidden" name="enabled" value="{% if m.enabled %}1{% else %}0{% endif %}">
+        {% if m.enabled %}
+          <span style="color: #2bb24c; font-weight: 700;" title="polling every cycle">● ACTIVE</span>
+        {% else %}
+          <span style="color: #d84545; font-weight: 700;" title="poller skips this mailbox">● PAUSED</span>
+        {% endif %}
+      </td>
+      <td>
+        <input type="text" name="llm_model" value="{{ m.llm_model or '' }}"
+               placeholder="{{ env_model }}" size="22"
+               title="Per-mailbox model override. Empty = use LLM_MODEL env default ({{ env_model }}). Set to e.g. 'claude-haiku-4-5' to save cost on a less-critical mailbox.">
       </td>
       <td>
         {% if m.provider == 'imap' %}
@@ -1253,7 +1326,7 @@ _MAILBOXES_HTML = """\
     </tr>
     </form>
     <tr>
-      <td colspan="8" style="border-bottom: 2px solid #f0f0f0; padding-bottom: 12px;">
+      <td colspan="9" style="border-bottom: 2px solid #f0f0f0; padding-bottom: 12px;">
         <form method="post" action="/mailboxes/{{ m.mailbox }}/reclassify" style="display:inline-flex; gap:6px; align-items:center; flex-wrap:wrap;"
               id="reclass-form-{{ m.mailbox }}"
               onsubmit="return confirm('Reclassify {{ m.mailbox }}? Scope: ' + (document.getElementById('days-{{ m.mailbox }}').value ? 'last ' + document.getElementById('days-{{ m.mailbox }}').value + ' day(s)' : 'ALL history') + '. Walks INBOX plus every legacy …-X folder, newest first.')">
@@ -1270,6 +1343,16 @@ _MAILBOXES_HTML = """\
           <button type="button" class="reclass" style="font-size:0.72rem;padding:1px 6px"
                   onclick="document.getElementById('days-{{ m.mailbox }}').value = ''">all</button>
         </form>
+        {% if m.enabled %}
+          <form method="post" action="/mailboxes/{{ m.mailbox }}/pause" style="display:inline; margin-left: 12px;"
+                onsubmit="return confirm('Pause {{ m.mailbox }}? Polling stops on the next cycle. Config is preserved; resume any time.')">
+            <button type="submit" class="reclass" style="background: #fde0e0; border-color: #c66; color: #7a1212;">⏸ Pause</button>
+          </form>
+        {% else %}
+          <form method="post" action="/mailboxes/{{ m.mailbox }}/resume" style="display:inline; margin-left: 12px;">
+            <button type="submit" class="reclass" style="background: #d4f8d4; border-color: #6c6; color: #060;">▶ Resume</button>
+          </form>
+        {% endif %}
         <form method="post" action="/mailboxes/{{ m.mailbox }}/delete" style="display:inline; margin-left: 12px;"
               onsubmit="return confirm('Remove this mailbox? Decisions stay, polling stops.')">
           <button type="submit" style="font-size:0.75rem;color:#a00">delete</button>
@@ -1324,6 +1407,8 @@ _MAILBOXES_HTML = """\
       {% for pr in profiles %}<option value="{{ pr }}">{{ pr }}</option>{% endfor %}
     </select>
   </label>
+  <label>Model <input type="text" name="llm_model" placeholder="{{ env_model }}" size="22"
+                     title="Optional per-mailbox model override. Blank = use LLM_MODEL env default ({{ env_model }})."></label>
   <br><br>
   <label>IMAP server <input type="text" name="imap_server" size="20" value="imap.gmail.com"></label>
   <label>Port <input type="number" name="imap_port" value="993" style="width:60px"></label>
