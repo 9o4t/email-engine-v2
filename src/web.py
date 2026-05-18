@@ -37,8 +37,23 @@ from flask import (Flask, Response, abort, after_this_request, jsonify,
 
 from classifier import hierarchy_path_for, invalidate_cache, list_folders
 from lib.apply import APPLY_MODES
-from lib.storage import MailboxConfig, Store, ThreadSummary
+from lib.storage import MAILBOX_PROFILES, MailboxConfig, Store, ThreadSummary
 from poller import reclassify_all
+
+
+# Name of the cookie we use to remember "who is submitting feedback".
+# Self-attested email; cookie is set on every successful submission.
+# Honest-but-spoofable — fine for trusted internal users; swap for a
+# real auth flow if the user pool ever grows beyond that.
+USER_COOKIE = "ee2_user"
+USER_COOKIE_MAX_AGE = 60 * 60 * 24 * 365  # one year
+
+
+def _current_user(default: str | None = None) -> str:
+    """Return the cookie-remembered user identifier, or the supplied
+    default (typically the mailbox address) if no cookie is set."""
+    val = (request.cookies.get(USER_COOKIE) or "").strip()
+    return val or (default or "")
 
 
 log = logging.getLogger(__name__)
@@ -136,7 +151,12 @@ def feedback_landing(token: str):
     the unguessable single-use token gates access (it's the equivalent
     of a magic-link). Renders a friendly 'no longer valid' page on
     any failure mode rather than leaking which one (used vs. expired
-    vs. never-existed)."""
+    vs. never-existed).
+
+    The 'your email' field auto-fills from (in order):
+      1. The ee2_user cookie set by your last submission
+      2. The mailbox owner address — sensible default on first click
+    The user can always override either default before submitting."""
     ctx = store.validate_feedback_token(token)
     if not ctx:
         return render_template_string(_FEEDBACK_DONE_HTML,
@@ -148,12 +168,14 @@ def feedback_landing(token: str):
                                       title="decision not found",
                                       body="The classification this link points to is no longer in the database. No further action needed.")
     folders = list_folders(ctx["mailbox"])
+    prefilled_user = _current_user(default=ctx["mailbox"])
     return render_template_string(
         _FEEDBACK_FORM_HTML,
         token=token,
         decision=d,
         folders=folders,
         mailbox=ctx["mailbox"],
+        prefilled_user=prefilled_user,
     )
 
 
@@ -175,6 +197,10 @@ def feedback_landing_post(token: str):
     correct_raw = (request.form.get("correct") or "").strip()
     suggested = (request.form.get("suggested") or "").strip() or None
     note = (request.form.get("note") or "").strip() or None
+    user_identifier = (
+        (request.form.get("user_identifier") or "").strip()
+        or _current_user(default=ctx["mailbox"])
+    ) or None
     if correct_raw not in ("1", "0"):
         abort(400, "correct=0|1 required")
     if correct_raw == "0" and not suggested:
@@ -185,17 +211,22 @@ def feedback_landing_post(token: str):
         correct=correct_raw == "1",
         suggested=suggested,
         note=note,
+        user_identifier=user_identifier,
     )
     # consume_feedback_token returns False on race; either way the row
     # was already written so we don't surface the race to the user.
     store.consume_feedback_token(token, fid)
     invalidate_cache()
-    return render_template_string(
+    resp = Response(render_template_string(
         _FEEDBACK_DONE_HTML,
         title="thank you",
         body=("Got it — recorded. Your reason will feed into the next "
               "taxonomy-improvement proposal on the dashboard."),
-    )
+    ))
+    if user_identifier:
+        resp.set_cookie(USER_COOKIE, user_identifier,
+                        max_age=USER_COOKIE_MAX_AGE, samesite="Lax")
+    return resp
 
 
 # --- Health -----------------------------------------------------------------
@@ -230,6 +261,14 @@ def feedback():
     correct_raw = request.form.get("correct", "").strip()
     suggested = request.form.get("suggested", "").strip() or None
     note = request.form.get("note", "").strip() or None
+    # `user_identifier` on dashboard pills: take from form if provided,
+    # else fall back to the cookie (set by the most recent submission
+    # in this browser). Dashboard pills don't expose the field today,
+    # so this almost always comes from the cookie.
+    user_identifier = (
+        (request.form.get("user_identifier") or "").strip()
+        or _current_user()
+    ) or None
     if not decision_id or correct_raw not in ("1", "0"):
         abort(400, "decision_id and correct=0|1 required")
     if correct_raw == "0" and not suggested:
@@ -241,11 +280,17 @@ def feedback():
         correct=correct_raw == "1",
         suggested=suggested,
         note=note,
+        user_identifier=user_identifier,
     )
     invalidate_cache()
     if request.headers.get("Accept", "").startswith("application/json"):
-        return jsonify({"ok": True, "feedback_id": fid})
-    return Response(status=303, headers={"Location": request.referrer or "/"})
+        resp = jsonify({"ok": True, "feedback_id": fid})
+    else:
+        resp = Response(status=303, headers={"Location": request.referrer or "/"})
+    if user_identifier:
+        resp.set_cookie(USER_COOKIE, user_identifier,
+                        max_age=USER_COOKIE_MAX_AGE, samesite="Lax")
+    return resp
 
 
 @app.get("/api/feedback.csv")
@@ -534,12 +579,16 @@ def mailboxes_list():
         _MAILBOXES_HTML,
         mailboxes=store.list_mailboxes(),
         apply_modes=APPLY_MODES,
+        profiles=MAILBOX_PROFILES,
     )
 
 
 @app.post("/mailboxes")
 @_require_auth
 def mailboxes_add():
+    profile = request.form.get("profile", "personal").strip().lower()
+    if profile not in MAILBOX_PROFILES:
+        abort(400, f"profile must be one of {MAILBOX_PROFILES}")
     mb = MailboxConfig(
         mailbox=request.form.get("mailbox", "").strip().lower(),
         provider=request.form.get("provider", "graph"),
@@ -549,6 +598,7 @@ def mailboxes_add():
         imap_port=int(request.form.get("imap_port", "993")),
         poll_interval=int(request.form.get("poll_interval", "30")),
         notes=request.form.get("notes", "").strip(),
+        profile=profile,
     )
     if not mb.mailbox:
         abort(400, "mailbox required")
@@ -572,6 +622,10 @@ def mailboxes_update(email: str):
     cur.imap_port = int(request.form.get("imap_port", cur.imap_port))
     cur.poll_interval = int(request.form.get("poll_interval", cur.poll_interval))
     cur.notes = request.form.get("notes", cur.notes)
+    new_profile = request.form.get("profile", cur.profile).strip().lower()
+    if new_profile and new_profile not in MAILBOX_PROFILES:
+        abort(400, f"profile must be one of {MAILBOX_PROFILES}")
+    cur.profile = new_profile or cur.profile
     if cur.apply_mode not in APPLY_MODES:
         abort(400, f"apply_mode must be one of {APPLY_MODES}")
     store.upsert_mailbox(cur)
@@ -994,7 +1048,7 @@ _MAILBOXES_HTML = """\
 
 <table>
   <thead><tr>
-    <th>Mailbox</th><th>Provider</th><th>Apply mode</th><th>Enabled</th>
+    <th>Mailbox</th><th>Provider</th><th>Profile</th><th>Apply mode</th><th>Enabled</th>
     <th>IMAP server:port</th><th>Poll interval</th><th>Actions</th>
   </tr></thead>
   <tbody>
@@ -1006,6 +1060,13 @@ _MAILBOXES_HTML = """\
         <div class="help"><a href="/hierarchies/{{ m.mailbox }}">view taxonomy</a></div>
       </td>
       <td>{{ m.provider }}</td>
+      <td>
+        <select name="profile" title="personal: feedback scoped per user. shared: feedback pooled across everyone.">
+          {% for pr in profiles %}
+            <option value="{{ pr }}" {% if pr == m.profile %}selected{% endif %}>{{ pr }}</option>
+          {% endfor %}
+        </select>
+      </td>
       <td>
         <select name="apply_mode">
           {% for am in apply_modes %}
@@ -1036,7 +1097,7 @@ _MAILBOXES_HTML = """\
     </tr>
     </form>
     <tr>
-      <td colspan="7" style="border-bottom: 2px solid #f0f0f0; padding-bottom: 12px;">
+      <td colspan="8" style="border-bottom: 2px solid #f0f0f0; padding-bottom: 12px;">
         <form method="post" action="/mailboxes/{{ m.mailbox }}/reclassify" style="display:inline-flex; gap:6px; align-items:center; flex-wrap:wrap;"
               id="reclass-form-{{ m.mailbox }}"
               onsubmit="return confirm('Reclassify {{ m.mailbox }}? Scope: ' + (document.getElementById('days-{{ m.mailbox }}').value ? 'last ' + document.getElementById('days-{{ m.mailbox }}').value + ' day(s)' : 'ALL history') + '. Walks INBOX plus every legacy …-X folder, newest first.')">
@@ -1100,6 +1161,11 @@ _MAILBOXES_HTML = """\
   <label>Apply mode
     <select name="apply_mode">
       {% for am in apply_modes %}<option value="{{ am }}">{{ am }}</option>{% endfor %}
+    </select>
+  </label>
+  <label>Profile
+    <select name="profile" title="personal: feedback scoped per user (your taxonomy reflects YOUR preferences). shared: feedback pooled (workflow mailboxes like quotes@/orders@/helpdesk@).">
+      {% for pr in profiles %}<option value="{{ pr }}">{{ pr }}</option>{% endfor %}
     </select>
   </label>
   <br><br>
@@ -1505,17 +1571,45 @@ _CHANGES_HTML = """\
 @_require_auth
 def feedback_review():
     """List feedback rows + any pending taxonomy proposals per mailbox.
-    The 'Generate proposal' button on each row kicks off an LLM call
-    that reads the accumulated feedback and proposes a JSON diff."""
+
+    Per-user scoping: the page picks a "current user" from the
+    ?user=... query param (overrides), the ee2_user cookie (default),
+    or empty (= 'all users' pool). Feedback rows + proposal generation
+    are filtered to that scope.
+
+    The 'Generate proposal from MY feedback' button uses the current
+    user; the 'Generate from ALL users' button is always available too
+    so cross-pollination is one click away."""
     mailbox = request.args.get("mailbox") or None
-    feedback = store.feedback_export(mailbox=mailbox)
+    mb_obj = store.get_mailbox(mailbox) if mailbox else None
+    mb_profile = mb_obj.profile if mb_obj else None
+    # Default scope: cookie when present; shared mailboxes default
+    # to pooled regardless (no per-user split makes sense for a
+    # workflow mailbox where everyone triages collectively).
+    requested_user = (request.args.get("user") or "").strip()
+    if requested_user == "__all__":
+        current_user = ""  # explicit "all users" view
+    elif requested_user:
+        current_user = requested_user
+    elif mb_profile == "shared":
+        current_user = ""
+    else:
+        current_user = _current_user()
+    feedback = store.feedback_export(
+        mailbox=mailbox,
+        user_identifier=current_user or None,
+    )
+    feedback_users = store.list_feedback_users(mailbox=mailbox)
     proposals = store.list_taxonomy_proposals(mailbox=mailbox, limit=20)
     return render_template_string(
         _FEEDBACK_REVIEW_HTML,
         feedback=feedback,
+        feedback_users=feedback_users,
         proposals=proposals,
         mailboxes=[m.mailbox for m in store.list_mailboxes()],
         current_mailbox=mailbox or "",
+        current_user=current_user,
+        mb_profile=mb_profile or "",
     )
 
 
@@ -1526,12 +1620,19 @@ def feedback_propose(email: str):
     mailbox. Synchronous because proposals are infrequent (the user
     clicks once after accumulating feedback); a background job + status
     poller is overkill here. ~30s response time is fine for a button
-    the user explicitly clicked."""
+    the user explicitly clicked.
+
+    Form param `user_identifier`:
+      - non-empty value → scope proposal to that user's feedback
+      - empty / missing → pool all users' feedback
+    The dashboard provides two buttons that POST the right value."""
     if not store.get_mailbox(email):
         abort(404, "unknown mailbox")
     from classifier import LLMConfig
     from taxonomy_review import generate_proposal
-    result = generate_proposal(email, store, LLMConfig.from_env())
+    user_id = (request.form.get("user_identifier") or "").strip() or None
+    result = generate_proposal(email, store, LLMConfig.from_env(),
+                               user_identifier=user_id)
     if not result.get("ok"):
         return Response(f"Proposal failed: {result.get('error')}",
                         status=400, mimetype="text/plain")
@@ -1607,15 +1708,43 @@ _FEEDBACK_REVIEW_HTML = """\
       {% for m in mailboxes %}<option value="{{ m }}" {% if m == current_mailbox %}selected{% endif %}>{{ m }}</option>{% endfor %}
     </select>
   </label>
+  <label>Scope:
+    <select name="user" onchange="this.form.submit()">
+      <option value="__all__" {% if not current_user %}selected{% endif %}>all users (pooled)</option>
+      {% for u in feedback_users %}
+        <option value="{{ u.user_identifier }}" {% if u.user_identifier == current_user %}selected{% endif %}>{{ u.user_identifier }} · {{ u.n }} row(s)</option>
+      {% endfor %}
+    </select>
+  </label>
+  <span class="help">
+    {% if mb_profile == 'shared' %}shared inbox → defaults to pooled
+    {% elif mb_profile == 'personal' %}personal inbox → defaults to your cookie ({{ current_user or '(not set)' }})
+    {% endif %}
+  </span>
 </form>
 
 {% if current_mailbox %}
 <div class="actions">
   <form method="post" action="/feedback-review/{{ current_mailbox }}/propose"
-        onsubmit="this.querySelector('button').disabled = true; this.querySelector('button').textContent='Thinking… (~30s)'; return true;">
-    <button type="submit">↻ Generate taxonomy proposal from {{ feedback|length }} feedback row(s)</button>
-    <span class="help">LLM reads the current taxonomy + every feedback row and proposes a JSON revision. You review the diff before anything is applied.</span>
+        onsubmit="this.querySelector('button').disabled = true; this.querySelector('button').textContent='Thinking… (~30s)'; return true;"
+        style="display: inline">
+    {% if current_user %}
+      <input type="hidden" name="user_identifier" value="{{ current_user }}">
+      <button type="submit">↻ Generate proposal from <strong>{{ current_user }}</strong>'s {{ feedback|length }} row(s)</button>
+    {% else %}
+      <button type="submit">↻ Generate proposal from ALL users' {{ feedback|length }} row(s) (pooled)</button>
+    {% endif %}
   </form>
+  {% if current_user %}
+  <form method="post" action="/feedback-review/{{ current_mailbox }}/propose"
+        onsubmit="this.querySelector('button').disabled = true; this.querySelector('button').textContent='Thinking… (~30s)'; return true;"
+        style="display: inline; margin-left: 8px">
+    <button type="submit" style="background: #eee">↻ Also generate pooled (cross-pollination)</button>
+  </form>
+  {% endif %}
+  <div class="help" style="margin-top: 6px">
+    LLM reads the current taxonomy + the feedback rows above and proposes a JSON revision. You review the diff before anything is applied.
+  </div>
 </div>
 {% else %}
 <div class="help" style="margin-bottom: 1rem;">Pick a mailbox above to enable the "generate proposal" action.</div>
@@ -1642,7 +1771,7 @@ _FEEDBACK_REVIEW_HTML = """\
 <h2>Feedback rows ({{ feedback|length }})</h2>
 <table>
   <thead><tr>
-    <th>When</th><th>Mailbox</th><th>Verdict</th><th>Subject</th>
+    <th>When</th><th>Mailbox</th><th>User</th><th>Verdict</th><th>Subject</th>
     <th>Right/Wrong</th><th>Note</th>
   </tr></thead>
   <tbody>
@@ -1650,6 +1779,7 @@ _FEEDBACK_REVIEW_HTML = """\
     <tr>
       <td class="when">{{ f.created_at[:19].replace('T',' ') }}</td>
       <td>{{ f.mailbox }}</td>
+      <td>{{ f.user_identifier or '(anonymous)' }}</td>
       <td>
         <span class="verdict {{ f.model_choice | verdict_class }}">{{ f.model_choice }}</span>
         {% if f.suggested and f.suggested != f.model_choice %}
@@ -1785,6 +1915,10 @@ _FEEDBACK_FORM_HTML = """\
 
     <label>Why? (your reasoning helps the next taxonomy update)</label>
     <textarea name="note" placeholder="e.g. 'sender is internal; thread is about a renewal contract; should always be high-priority not medium'"></textarea>
+
+    <label>Your email <span class="help" style="text-transform: none; letter-spacing: 0; font-weight: 400">(so your taxonomy reflects YOUR preferences)</span></label>
+    <input type="text" name="user_identifier" value="{{ prefilled_user }}"
+           placeholder="you@example.com">
 
     <button type="submit">Submit feedback</button>
   </form>

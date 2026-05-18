@@ -134,17 +134,25 @@ def generate_proposal(
     store: Store,
     cfg: LLMConfig | None = None,
     limit: int = 200,
+    user_identifier: str | None = None,
 ) -> dict:
     """Run the LLM once with the current taxonomy + recent feedback.
     Stores the result as a taxonomy_proposals row and returns
     {ok, proposal_id, summary, error}.
 
+    `user_identifier`: scope to one submitter's feedback (drives the
+    'mine only' button on personal mailboxes). Pass None to pool every
+    user's feedback ('all users' button + the default for shared
+    mailboxes).
+
     Uses the same OpenAI-compatible client as the classifier (Haystack's
-    OpenAIGenerator is overkill here — direct httpx-style call). We do
-    use the same LLM endpoint config though so the operator only
-    configures one set of LLM_* env vars."""
+    OpenAIGenerator is overkill here — direct requests call). We use
+    the same LLM endpoint config so the operator only configures one
+    set of LLM_* env vars."""
     cfg = cfg or LLMConfig.from_env()
-    feedback_rows = store.feedback_export(mailbox=mailbox)[:limit]
+    feedback_rows = store.feedback_export(
+        mailbox=mailbox, user_identifier=user_identifier,
+    )[:limit]
     if not feedback_rows:
         return {"ok": False, "error": "no feedback rows yet for this mailbox"}
 
@@ -187,16 +195,28 @@ def generate_proposal(
     rationale = parsed.get("rationale") or ""
     summary = parsed.get("summary") or ""
 
+    # We record the scope inside the rationale prefix so the diff view
+    # makes clear whether this proposal was per-user or pooled — the
+    # taxonomy_proposals row itself doesn't carry a scope column today.
+    scope_note = (
+        f"_Scope: feedback from {user_identifier}_" if user_identifier
+        else "_Scope: pooled feedback from ALL users_"
+    )
+    rationale_text = (
+        scope_note + "\n\n" +
+        (rationale if isinstance(rationale, str) else json.dumps(rationale, indent=2))
+    )
     pid = store.insert_taxonomy_proposal(
         mailbox=mailbox,
         based_on_feedback_count=len(feedback_rows),
         current_json=current_json,
         proposed_json=proposed_json_text,
-        rationale=rationale if isinstance(rationale, str) else json.dumps(rationale, indent=2),
+        rationale=rationale_text,
         llm_raw=raw[:8000],
     )
     return {"ok": True, "proposal_id": pid, "summary": summary,
-            "based_on": len(feedback_rows)}
+            "based_on": len(feedback_rows),
+            "scope": user_identifier or "all-users"}
 
 
 def apply_proposal(

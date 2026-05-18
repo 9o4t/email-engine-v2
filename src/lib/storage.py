@@ -38,7 +38,12 @@ CREATE TABLE IF NOT EXISTS mailbox_config (
     imap_server    TEXT NOT NULL DEFAULT '',
     imap_port      INTEGER NOT NULL DEFAULT 993,
     poll_interval  INTEGER NOT NULL DEFAULT 30,   -- seconds
-    notes          TEXT NOT NULL DEFAULT ''
+    notes          TEXT NOT NULL DEFAULT '',
+    profile        TEXT NOT NULL DEFAULT 'personal'  -- 'personal' | 'shared'
+    -- 'personal' = one human's mailbox; feedback + proposals scoped per user
+    --              (your taxonomy reflects YOUR preferences, not delegates')
+    -- 'shared'   = workflow mailbox (quotes@/orders@/helpdesk@); feedback
+    --              pooled across everyone who triages it
 );
 
 CREATE TABLE IF NOT EXISTS watermarks (
@@ -70,14 +75,18 @@ CREATE INDEX IF NOT EXISTS idx_decisions_mailbox_created
     ON decisions(mailbox, created_at DESC);
 
 CREATE TABLE IF NOT EXISTS feedback (
-    id           TEXT PRIMARY KEY,
-    created_at   TEXT NOT NULL,
-    decision_id  TEXT NOT NULL REFERENCES decisions(id),
-    correct      INTEGER NOT NULL,    -- 1 right, 0 wrong
-    suggested    TEXT,                -- correct folder when wrong
-    note         TEXT
+    id              TEXT PRIMARY KEY,
+    created_at      TEXT NOT NULL,
+    decision_id     TEXT NOT NULL REFERENCES decisions(id),
+    correct         INTEGER NOT NULL,    -- 1 right, 0 wrong
+    suggested       TEXT,                -- correct folder when wrong
+    note            TEXT,
+    user_identifier TEXT                 -- email/handle of submitter; nullable
 );
 CREATE INDEX IF NOT EXISTS idx_feedback_decision ON feedback(decision_id);
+-- idx_feedback_user is created AFTER additive migrations run (the
+-- column may not exist yet on an upgrade from an older schema). See
+-- _apply_additive_migrations and _POST_MIGRATION_SCHEMA below.
 
 CREATE TABLE IF NOT EXISTS jobs (
     mailbox     TEXT NOT NULL,
@@ -174,7 +183,18 @@ CREATE INDEX IF NOT EXISTS idx_taxonomy_proposals_mailbox
 """
 
 
+# Indexes that touch columns added by additive migrations. Runs AFTER
+# _apply_additive_migrations so the column exists by the time CREATE
+# INDEX references it.
+_POST_MIGRATION_SCHEMA = """
+CREATE INDEX IF NOT EXISTS idx_feedback_user ON feedback(user_identifier);
+"""
+
+
 # --- Dataclasses ------------------------------------------------------------
+
+MAILBOX_PROFILES = ("personal", "shared")
+
 
 @dataclass
 class MailboxConfig:
@@ -186,6 +206,7 @@ class MailboxConfig:
     imap_port: int
     poll_interval: int
     notes: str
+    profile: str = "personal"
 
 
 @dataclass
@@ -249,6 +270,33 @@ class Store:
         self._lock = threading.Lock()
         with self._conn() as c:
             c.executescript(_SCHEMA)
+            self._apply_additive_migrations(c)
+            c.executescript(_POST_MIGRATION_SCHEMA)
+
+    # Additive column adds for already-existing databases. CREATE TABLE
+    # IF NOT EXISTS doesn't add new columns to a pre-existing table, so
+    # column additions go here. SQLite's ALTER TABLE ... ADD COLUMN is a
+    # constant-time metadata change — safe to run on every startup.
+    # Each ALTER is wrapped in try/except so a column that's already
+    # present (e.g. the table was created with the new schema) doesn't
+    # blow up boot.
+    @staticmethod
+    def _apply_additive_migrations(c: sqlite3.Connection) -> None:
+        adds = [
+            ("mailbox_config", "profile",         "TEXT NOT NULL DEFAULT 'personal'"),
+            ("feedback",       "user_identifier", "TEXT"),
+        ]
+        for table, col, decl in adds:
+            try:
+                c.execute(f"ALTER TABLE {table} ADD COLUMN {col} {decl}")
+            except sqlite3.OperationalError as e:
+                # Either "duplicate column name" (already migrated) or the
+                # table doesn't exist yet (initial create just made it
+                # with the new column). Both are fine; anything else is
+                # a real schema mismatch and worth raising.
+                msg = str(e).lower()
+                if "duplicate column" not in msg and "no such table" not in msg:
+                    raise
 
     @contextmanager
     def _conn(self) -> Iterator[sqlite3.Connection]:
@@ -267,8 +315,9 @@ class Store:
         with self._conn() as c:
             c.execute(
                 """INSERT INTO mailbox_config
-                   (mailbox, provider, apply_mode, enabled, imap_server, imap_port, poll_interval, notes)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                   (mailbox, provider, apply_mode, enabled, imap_server, imap_port,
+                    poll_interval, notes, profile)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                    ON CONFLICT(mailbox) DO UPDATE SET
                      provider=excluded.provider,
                      apply_mode=excluded.apply_mode,
@@ -276,10 +325,12 @@ class Store:
                      imap_server=excluded.imap_server,
                      imap_port=excluded.imap_port,
                      poll_interval=excluded.poll_interval,
-                     notes=excluded.notes""",
+                     notes=excluded.notes,
+                     profile=excluded.profile""",
                 (
                     mb.mailbox, mb.provider, mb.apply_mode, 1 if mb.enabled else 0,
                     mb.imap_server, mb.imap_port, mb.poll_interval, mb.notes,
+                    mb.profile or "personal",
                 ),
             )
 
@@ -406,14 +457,22 @@ class Store:
 
     # --- feedback -----------------------------------------------------------
 
-    def record_feedback(self, *, decision_id: str, correct: bool, suggested: str | None, note: str | None) -> str:
+    def record_feedback(
+        self, *, decision_id: str, correct: bool, suggested: str | None,
+        note: str | None, user_identifier: str | None = None,
+    ) -> str:
+        """`user_identifier`: free-form (typically an email). Cookie-
+        remembered on the form. None for legacy submissions / when the
+        operator declines to identify."""
         fid = str(uuid.uuid4())
         now = datetime.now(timezone.utc).isoformat()
         with self._conn() as c:
             c.execute(
-                """INSERT INTO feedback (id, created_at, decision_id, correct, suggested, note)
-                   VALUES (?, ?, ?, ?, ?, ?)""",
-                (fid, now, decision_id, 1 if correct else 0, suggested, note),
+                """INSERT INTO feedback
+                     (id, created_at, decision_id, correct, suggested, note, user_identifier)
+                   VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                (fid, now, decision_id, 1 if correct else 0,
+                 suggested, note, user_identifier),
             )
         return fid
 
@@ -765,19 +824,50 @@ class Store:
                 ),
             )
 
-    def feedback_export(self, mailbox: str | None = None) -> list[dict]:
+    def feedback_export(
+        self, mailbox: str | None = None,
+        user_identifier: str | None = None,
+    ) -> list[dict]:
+        """Joined feedback dataset. Pass `user_identifier` to scope to one
+        submitter (drives per-user proposal generation on personal
+        mailboxes); pass None to pool across everyone (the 'all users'
+        toggle in the UI, and the default for shared mailboxes)."""
         sql = """
             SELECT d.mailbox, d.provider, d.sender, d.subject, d.body_preview,
                    d.verdict_folder AS model_choice,
-                   f.correct, f.suggested, f.note, f.created_at
+                   f.correct, f.suggested, f.note, f.created_at,
+                   f.user_identifier
             FROM feedback f
             JOIN decisions d ON d.id = f.decision_id
+            WHERE 1=1
         """
-        args: tuple = ()
+        args: list = []
         if mailbox:
-            sql += " WHERE d.mailbox = ?"
-            args = (mailbox,)
+            sql += " AND d.mailbox = ?"
+            args.append(mailbox)
+        if user_identifier:
+            sql += " AND f.user_identifier = ?"
+            args.append(user_identifier)
         sql += " ORDER BY f.created_at DESC"
+        with self._conn() as c:
+            rows = c.execute(sql, args).fetchall()
+        return [dict(r) for r in rows]
+
+    def list_feedback_users(self, mailbox: str | None = None) -> list[dict]:
+        """Distinct user_identifiers that have submitted feedback, with
+        per-user counts. Drives the 'scope to user' dropdown on
+        /feedback-review."""
+        sql = """
+            SELECT f.user_identifier AS user_identifier, COUNT(*) AS n
+            FROM feedback f
+            JOIN decisions d ON d.id = f.decision_id
+            WHERE f.user_identifier IS NOT NULL AND f.user_identifier != ''
+        """
+        args: list = []
+        if mailbox:
+            sql += " AND d.mailbox = ?"
+            args.append(mailbox)
+        sql += " GROUP BY f.user_identifier ORDER BY n DESC"
         with self._conn() as c:
             rows = c.execute(sql, args).fetchall()
         return [dict(r) for r in rows]
@@ -786,6 +876,14 @@ class Store:
 # --- Row → dataclass --------------------------------------------------------
 
 def _row_to_mailbox(r: sqlite3.Row) -> MailboxConfig:
+    # `profile` lookup tolerates the column-absent edge case on the very
+    # first boot after an upgrade — additive migration runs in __init__
+    # so by the time anyone calls this it should be present, but defend
+    # anyway. sqlite3.Row.keys() reports the actual SELECT columns.
+    try:
+        profile = r["profile"] or "personal"
+    except (IndexError, KeyError):
+        profile = "personal"
     return MailboxConfig(
         mailbox=r["mailbox"],
         provider=r["provider"],
@@ -795,6 +893,7 @@ def _row_to_mailbox(r: sqlite3.Row) -> MailboxConfig:
         imap_port=r["imap_port"],
         poll_interval=r["poll_interval"],
         notes=r["notes"],
+        profile=profile,
     )
 
 
