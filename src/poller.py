@@ -334,6 +334,8 @@ def _classify_thread_and_apply(
     moved_count = 0
     tagged_count = 0
     err_count = 0
+    latest_decision_id: str | None = None
+    latest_post_apply_id: str | None = None
     for tm in thread:
         src = tm.parent_folder or "INBOX"
         # If we already happen to be in the right place (e.g. v2 classified
@@ -356,7 +358,7 @@ def _classify_thread_and_apply(
         if result.error:
             err_count += 1
 
-        store.insert_decision(
+        did = store.insert_decision(
             mailbox=mb.mailbox,
             provider=mb.provider,
             message_id=result.new_message_id,
@@ -377,6 +379,22 @@ def _classify_thread_and_apply(
             moved=result.moved,
             apply_error=result.error,
         )
+        if tm.id == latest_msg.id:
+            latest_decision_id = did
+            latest_post_apply_id = result.new_message_id
+
+    # 6. Inject the feedback footer on the latest message of the thread.
+    # One footer per (decision_id) — older messages in the thread are
+    # already read and modifying them now would be intrusive. Best-effort:
+    # any provider/Graph error here is logged + ignored, the classification
+    # itself is already persisted.
+    if latest_decision_id and latest_post_apply_id:
+        _inject_feedback_footer(
+            store=store, provider=provider, mailbox=mb.mailbox,
+            decision_id=latest_decision_id,
+            message_id=latest_post_apply_id,
+            verdict_folder=folder_name,
+        )
 
     log.info(
         "[%s] thread %s | %s → %s | %d msg(s), tagged=%d moved=%d err=%d",
@@ -386,6 +404,74 @@ def _classify_thread_and_apply(
         folder_name,
         len(thread), tagged_count, moved_count, err_count,
     )
+
+
+# --- Feedback footer injection ---------------------------------------------
+
+def _inject_feedback_footer(
+    *, store: Store, provider: Provider, mailbox: str,
+    decision_id: str, message_id: str, verdict_folder: str,
+) -> None:
+    """Mint a one-shot feedback token and PATCH a discreet footer into
+    the message body. Best-effort end-to-end — any failure (no base URL
+    configured, Graph PATCH error, etc.) is logged at WARN and ignored.
+
+    The link in the footer is unguessable (sha256-hashed token), single-
+    use (consumed on form submit), and 30-day-expiring. Privacy footprint:
+    if the user forwards the email, the link goes with it — but the
+    token is scoped to this one decision (no broader account access),
+    and the landing page never displays anything beyond the subject."""
+    base_url = (os.getenv("FEEDBACK_BASE_URL") or "").rstrip("/")
+    if not base_url:
+        # First time: log once-ish so the operator knows the feature is
+        # silently disabled until they set the env var.
+        log.warning(
+            "FEEDBACK_BASE_URL not set — skipping feedback footer injection "
+            "(set it to e.g. https://email.utility.cx to enable)."
+        )
+        return
+
+    try:
+        token = store.mint_feedback_token(decision_id=decision_id, mailbox=mailbox)
+    except Exception as e:
+        log.warning("[%s] mint feedback token failed: %s", mailbox, e)
+        return
+    feedback_url = f"{base_url}/f/{token}"
+
+    # Sentinel class `ee2-feedback-footer` is what _append_html_footer
+    # checks for de-dup; keep it stable.
+    html = (
+        '<div class="ee2-feedback-footer" '
+        'style="margin-top:24px;padding-top:8px;border-top:1px solid #e0e0e0;'
+        'font-family:system-ui,-apple-system,Segoe UI,sans-serif;'
+        'font-size:11px;color:#888;line-height:1.4">'
+        '<em>email-engine triage:</em> classified as '
+        f'<strong>{_html_escape(verdict_folder)}</strong> · '
+        f'<a href="{feedback_url}" style="color:#5b6cff;text-decoration:none">'
+        'wrong? tell me why ↗</a>'
+        '</div>'
+    )
+    text = (
+        f"---\n"
+        f"email-engine triage: classified as {verdict_folder} · "
+        f"wrong? {feedback_url}"
+    )
+
+    try:
+        ok = provider.append_to_body(
+            message_id, html_snippet=html, text_snippet=text,
+        )
+        if not ok:
+            log.info("[%s] footer injection skipped for %s (provider returned False)",
+                     mailbox, message_id[:24])
+    except Exception as e:
+        log.warning("[%s] footer injection failed for %s: %s",
+                    mailbox, message_id[:24], e)
+
+
+def _html_escape(s: str) -> str:
+    return (s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+             .replace('"', "&quot;").replace("'", "&#39;"))
 
 
 # --- Main loop -------------------------------------------------------------

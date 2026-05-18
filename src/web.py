@@ -128,6 +128,76 @@ def _require_api_auth(fn):
     return wrapper
 
 
+# --- Feedback landing page (no auth — the token IS the auth) ---------------
+
+@app.get("/f/<token>")
+def feedback_landing(token: str):
+    """Display the feedback form for a footer-link click. Anonymous;
+    the unguessable single-use token gates access (it's the equivalent
+    of a magic-link). Renders a friendly 'no longer valid' page on
+    any failure mode rather than leaking which one (used vs. expired
+    vs. never-existed)."""
+    ctx = store.validate_feedback_token(token)
+    if not ctx:
+        return render_template_string(_FEEDBACK_DONE_HTML,
+                                      title="link expired",
+                                      body="This feedback link is no longer valid. It may have been used already, or it may have expired (links last 30 days).")
+    d = store.get_decision(ctx["decision_id"])
+    if not d:
+        return render_template_string(_FEEDBACK_DONE_HTML,
+                                      title="decision not found",
+                                      body="The classification this link points to is no longer in the database. No further action needed.")
+    folders = list_folders(ctx["mailbox"])
+    return render_template_string(
+        _FEEDBACK_FORM_HTML,
+        token=token,
+        decision=d,
+        folders=folders,
+        mailbox=ctx["mailbox"],
+    )
+
+
+@app.post("/f/<token>")
+def feedback_landing_post(token: str):
+    """Persist the feedback row + consume the token. Shows a thank-you
+    page so the user gets visible confirmation in the browser."""
+    ctx = store.validate_feedback_token(token)
+    if not ctx:
+        return render_template_string(_FEEDBACK_DONE_HTML,
+                                      title="link expired",
+                                      body="This feedback link is no longer valid. If you'd already submitted feedback, that's the most likely reason."), 410
+    d = store.get_decision(ctx["decision_id"])
+    if not d:
+        return render_template_string(_FEEDBACK_DONE_HTML,
+                                      title="decision not found",
+                                      body="That classification is no longer in the database."), 410
+
+    correct_raw = (request.form.get("correct") or "").strip()
+    suggested = (request.form.get("suggested") or "").strip() or None
+    note = (request.form.get("note") or "").strip() or None
+    if correct_raw not in ("1", "0"):
+        abort(400, "correct=0|1 required")
+    if correct_raw == "0" and not suggested:
+        abort(400, "wrong-classification feedback needs a suggested folder")
+
+    fid = store.record_feedback(
+        decision_id=ctx["decision_id"],
+        correct=correct_raw == "1",
+        suggested=suggested,
+        note=note,
+    )
+    # consume_feedback_token returns False on race; either way the row
+    # was already written so we don't surface the race to the user.
+    store.consume_feedback_token(token, fid)
+    invalidate_cache()
+    return render_template_string(
+        _FEEDBACK_DONE_HTML,
+        title="thank you",
+        body=("Got it — recorded. Your reason will feed into the next "
+              "taxonomy-improvement proposal on the dashboard."),
+    )
+
+
 # --- Health -----------------------------------------------------------------
 
 @app.get("/healthz")
@@ -708,6 +778,7 @@ _NAV = """\
   <a href="/">Decisions</a> ·
   <a href="/threads">Threads</a> ·
   <a href="/changes">Changes</a> ·
+  <a href="/feedback-review">Feedback</a> ·
   <a href="/mailboxes">Mailboxes</a> ·
   <a href="/admin/db.sqlite">Download DB</a> ·
   <a href="/api/feedback.csv">Feedback CSV</a> ·
@@ -1425,6 +1496,314 @@ _CHANGES_HTML = """\
     {% endfor %}
   </tbody>
 </table>
+"""
+
+
+# --- Feedback review + LLM taxonomy proposals -------------------------------
+
+@app.get("/feedback-review")
+@_require_auth
+def feedback_review():
+    """List feedback rows + any pending taxonomy proposals per mailbox.
+    The 'Generate proposal' button on each row kicks off an LLM call
+    that reads the accumulated feedback and proposes a JSON diff."""
+    mailbox = request.args.get("mailbox") or None
+    feedback = store.feedback_export(mailbox=mailbox)
+    proposals = store.list_taxonomy_proposals(mailbox=mailbox, limit=20)
+    return render_template_string(
+        _FEEDBACK_REVIEW_HTML,
+        feedback=feedback,
+        proposals=proposals,
+        mailboxes=[m.mailbox for m in store.list_mailboxes()],
+        current_mailbox=mailbox or "",
+    )
+
+
+@app.post("/feedback-review/<path:email>/propose")
+@_require_auth
+def feedback_propose(email: str):
+    """Synchronous LLM call to generate a taxonomy proposal for one
+    mailbox. Synchronous because proposals are infrequent (the user
+    clicks once after accumulating feedback); a background job + status
+    poller is overkill here. ~30s response time is fine for a button
+    the user explicitly clicked."""
+    if not store.get_mailbox(email):
+        abort(404, "unknown mailbox")
+    from classifier import LLMConfig
+    from taxonomy_review import generate_proposal
+    result = generate_proposal(email, store, LLMConfig.from_env())
+    if not result.get("ok"):
+        return Response(f"Proposal failed: {result.get('error')}",
+                        status=400, mimetype="text/plain")
+    return Response(status=303, headers={
+        "Location": f"/feedback-review/proposal/{result['proposal_id']}",
+    })
+
+
+@app.get("/feedback-review/proposal/<proposal_id>")
+@_require_auth
+def feedback_proposal_view(proposal_id: str):
+    p = store.get_taxonomy_proposal(proposal_id)
+    if not p:
+        abort(404, "proposal not found")
+    return render_template_string(_PROPOSAL_DIFF_HTML, p=p)
+
+
+@app.post("/feedback-review/proposal/<proposal_id>/apply")
+@_require_auth
+def feedback_proposal_apply(proposal_id: str):
+    from taxonomy_review import apply_proposal
+    result = apply_proposal(proposal_id, store)
+    if not result.get("ok"):
+        return Response(f"Apply failed: {result.get('error')}",
+                        status=400, mimetype="text/plain")
+    # Bust hierarchy + pipeline caches so the next classification picks
+    # up the new taxonomy without a poller restart.
+    invalidate_cache()
+    return Response(status=303, headers={
+        "Location": f"/feedback-review/proposal/{proposal_id}",
+    })
+
+
+@app.post("/feedback-review/proposal/<proposal_id>/discard")
+@_require_auth
+def feedback_proposal_discard(proposal_id: str):
+    from taxonomy_review import discard_proposal
+    discard_proposal(proposal_id, store)
+    return Response(status=303, headers={"Location": "/feedback-review"})
+
+
+_FEEDBACK_REVIEW_HTML = """\
+<!doctype html><title>email-engine-v2 — feedback review</title>
+<style>
+  body { font: 14px/1.4 -apple-system, system-ui, sans-serif; margin: 1.5rem; max-width: 1100px; }
+  h1, h2 { font-size: 1.15rem; margin: 0 0 12px; }
+  table { border-collapse: collapse; width: 100%; margin-bottom: 1.5rem; }
+  th, td { padding: 6px 8px; border-bottom: 1px solid #eee; vertical-align: top; font-size: 0.88rem; }
+  th { text-align: left; background: #fafafa; }
+  .when { color: #777; font-size: 0.78rem; white-space: nowrap; }
+  .arrow { color: #888; }
+  .right { color: #196b3a; font-weight: 600; }
+  .wrong { color: #b32626; font-weight: 600; }
+  .note  { color: #444; font-style: italic; max-width: 480px;
+           white-space: pre-wrap; word-break: break-word; }
+  .actions { background: #f0f4ff; border: 1px solid #b9c5ec; padding: 12px;
+             border-radius: 6px; margin-bottom: 1.5rem; }
+  .actions button { padding: 6px 14px; font-size: 0.9rem; }
+  .help { color: #666; font-size: 0.85rem; }
+  .prop-card { border: 1px solid #d6d6dc; border-radius: 6px;
+               padding: 10px 14px; margin: 6px 0; font-size: 0.88rem; }
+  .prop-card.applied   { background: #ecf8ef; border-color: #6dc488; }
+  .prop-card.discarded { background: #fbeaea; border-color: #d68b8b; opacity: 0.7; }
+  a { color: #4a5dd0; }
+</style>
+""" + _DARK_MODE_CSS + _VERDICT_CSS + _NAV + """\
+<h1>Feedback review</h1>
+
+<form method="get" style="margin-bottom: 1rem;">
+  <label>Mailbox:
+    <select name="mailbox" onchange="this.form.submit()">
+      <option value="">(all)</option>
+      {% for m in mailboxes %}<option value="{{ m }}" {% if m == current_mailbox %}selected{% endif %}>{{ m }}</option>{% endfor %}
+    </select>
+  </label>
+</form>
+
+{% if current_mailbox %}
+<div class="actions">
+  <form method="post" action="/feedback-review/{{ current_mailbox }}/propose"
+        onsubmit="this.querySelector('button').disabled = true; this.querySelector('button').textContent='Thinking… (~30s)'; return true;">
+    <button type="submit">↻ Generate taxonomy proposal from {{ feedback|length }} feedback row(s)</button>
+    <span class="help">LLM reads the current taxonomy + every feedback row and proposes a JSON revision. You review the diff before anything is applied.</span>
+  </form>
+</div>
+{% else %}
+<div class="help" style="margin-bottom: 1rem;">Pick a mailbox above to enable the "generate proposal" action.</div>
+{% endif %}
+
+<h2>Recent taxonomy proposals ({{ proposals|length }})</h2>
+{% if not proposals %}
+<p class="help">No proposals yet.</p>
+{% endif %}
+{% for p in proposals %}
+<div class="prop-card{% if p.applied_at %} applied{% elif p.discarded_at %} discarded{% endif %}">
+  <div>
+    <a href="/feedback-review/proposal/{{ p.id }}"><strong>{{ p.mailbox }}</strong> · proposal {{ p.id[:8] }}</a>
+    <span class="when">{{ p.created_at[:19].replace('T',' ') }} UTC · based on {{ p.based_on_feedback_count }} feedback row(s)</span>
+  </div>
+  <div class="help">
+    {% if p.applied_at %}✓ applied {{ p.applied_at[:19].replace('T',' ') }} UTC
+    {% elif p.discarded_at %}✗ discarded {{ p.discarded_at[:19].replace('T',' ') }} UTC
+    {% else %}pending review{% endif %}
+  </div>
+</div>
+{% endfor %}
+
+<h2>Feedback rows ({{ feedback|length }})</h2>
+<table>
+  <thead><tr>
+    <th>When</th><th>Mailbox</th><th>Verdict</th><th>Subject</th>
+    <th>Right/Wrong</th><th>Note</th>
+  </tr></thead>
+  <tbody>
+  {% for f in feedback %}
+    <tr>
+      <td class="when">{{ f.created_at[:19].replace('T',' ') }}</td>
+      <td>{{ f.mailbox }}</td>
+      <td>
+        <span class="verdict {{ f.model_choice | verdict_class }}">{{ f.model_choice }}</span>
+        {% if f.suggested and f.suggested != f.model_choice %}
+          <span class="arrow">→</span>
+          <span class="verdict {{ f.suggested | verdict_class }}">{{ f.suggested }}</span>
+        {% endif %}
+      </td>
+      <td>{{ (f.subject or '(no subject)')[:60] }}</td>
+      <td>{% if f.correct %}<span class="right">✓ correct</span>{% else %}<span class="wrong">✗ wrong</span>{% endif %}</td>
+      <td class="note">{{ f.note or '' }}</td>
+    </tr>
+  {% endfor %}
+  </tbody>
+</table>
+"""
+
+
+_PROPOSAL_DIFF_HTML = """\
+<!doctype html><title>proposal {{ p.id[:8] }} — email-engine-v2</title>
+<style>
+  body { font: 14px/1.4 -apple-system, system-ui, sans-serif; margin: 1.5rem; max-width: 1100px; }
+  h1, h2 { font-size: 1.1rem; }
+  pre { background: #f5f5f8; padding: 10px 12px; border-radius: 6px;
+        white-space: pre-wrap; word-break: break-word; font-size: 0.82rem;
+        line-height: 1.4; max-height: 420px; overflow: auto; }
+  .cols { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+  .rationale { background: #fffaf0; border-left: 3px solid #d4a82a;
+               padding: 10px 14px; margin: 12px 0;
+               white-space: pre-wrap; word-break: break-word; }
+  .actions { margin: 12px 0 24px; }
+  .actions form { display: inline-block; margin-right: 8px; }
+  .actions button { padding: 7px 18px; font-size: 0.92rem; }
+  .actions button.apply   { background: #2bb24c; color: #fff; border: none; border-radius: 4px; }
+  .actions button.discard { background: #d84545; color: #fff; border: none; border-radius: 4px; }
+  .help { color: #666; font-size: 0.85rem; }
+  .badge { display: inline-block; padding: 2px 8px; border-radius: 12px;
+           font-size: 0.78rem; margin-left: 4px; }
+  .badge.applied   { background: #d8f0de; color: #196b3a; }
+  .badge.discarded { background: #fbe2e2; color: #b32626; }
+</style>
+""" + _DARK_MODE_CSS + _VERDICT_CSS + _NAV + """\
+<h1>
+  Taxonomy proposal — {{ p.mailbox }}
+  {% if p.applied_at %}<span class="badge applied">applied {{ p.applied_at[:19] }} UTC</span>{% endif %}
+  {% if p.discarded_at %}<span class="badge discarded">discarded {{ p.discarded_at[:19] }} UTC</span>{% endif %}
+</h1>
+<p class="help">Based on {{ p.based_on_feedback_count }} feedback row(s). Created {{ p.created_at[:19] }} UTC.</p>
+
+{% if p.rationale %}
+<h2>Rationale</h2>
+<div class="rationale">{{ p.rationale }}</div>
+{% endif %}
+
+{% if not p.applied_at and not p.discarded_at %}
+<div class="actions">
+  <form method="post" action="/feedback-review/proposal/{{ p.id }}/apply"
+        onsubmit="return confirm('Write this taxonomy to the persistent override path? The next classification cycle picks it up immediately.')">
+    <button type="submit" class="apply">✓ Apply proposal</button>
+  </form>
+  <form method="post" action="/feedback-review/proposal/{{ p.id }}/discard">
+    <button type="submit" class="discard">✗ Discard</button>
+  </form>
+  <span class="help">Apply writes to <code>/data/hierarchies/&lt;mailbox&gt;.json</code> (persistent volume).</span>
+</div>
+{% endif %}
+
+<h2>Diff</h2>
+<div class="cols">
+  <div>
+    <h3 style="font-size: 0.95rem;">Current</h3>
+    <pre>{{ p.current_json }}</pre>
+  </div>
+  <div>
+    <h3 style="font-size: 0.95rem;">Proposed</h3>
+    <pre>{{ p.proposed_json }}</pre>
+  </div>
+</div>
+"""
+
+
+_FEEDBACK_FORM_HTML = """\
+<!doctype html><meta charset="utf-8"><title>feedback — email-engine</title>
+<style>
+  body { font: 15px/1.5 -apple-system, system-ui, Segoe UI, sans-serif;
+         margin: 0; padding: 0; background: #f6f7fb; color: #222; }
+  .card { max-width: 580px; margin: 4rem auto; background: #fff;
+          border-radius: 12px; padding: 28px 32px;
+          box-shadow: 0 1px 3px rgba(0,0,0,.04), 0 8px 24px rgba(0,0,0,.06); }
+  h1 { font-size: 1.15rem; margin: 0 0 18px; color: #333; }
+  .meta { background: #f3f4f8; border-radius: 8px; padding: 10px 14px;
+          margin-bottom: 20px; font-size: 0.9rem; color: #555; }
+  .meta strong { color: #222; }
+  label { display: block; margin: 14px 0 4px; font-weight: 600; color: #444;
+          font-size: 0.85rem; text-transform: uppercase; letter-spacing: 0.4px; }
+  select, textarea, input[type=text] {
+    width: 100%; padding: 8px 10px; font-size: 0.95rem;
+    border: 1px solid #d4d5dc; border-radius: 6px; box-sizing: border-box;
+    font-family: inherit;
+  }
+  textarea { min-height: 110px; resize: vertical; }
+  .row { display: flex; gap: 10px; align-items: center; margin: 8px 0; }
+  .row label.inline { margin: 0; font-weight: 500; text-transform: none;
+                      letter-spacing: 0; font-size: 0.95rem; color: #333;
+                      display: inline-flex; align-items: center; gap: 8px; }
+  button { margin-top: 18px; padding: 10px 22px; background: #5b6cff;
+           color: #fff; border: none; border-radius: 6px;
+           font-size: 0.95rem; font-weight: 600; cursor: pointer; }
+  button:hover { background: #4456e8; }
+  .help { color: #777; font-size: 0.82rem; margin-top: 4px; }
+</style>
+<body>
+<div class="card">
+  <h1>Was this classification wrong?</h1>
+  <div class="meta">
+    <div><strong>Subject:</strong> {{ decision.subject or '(no subject)' }}</div>
+    <div><strong>From:</strong> {{ decision.sender or '(unknown)' }}</div>
+    <div><strong>Classified as:</strong> {{ decision.verdict_folder }}</div>
+  </div>
+  <form method="post">
+    <div class="row">
+      <label class="inline"><input type="radio" name="correct" value="1" required> ✓ actually correct</label>
+      <label class="inline"><input type="radio" name="correct" value="0" checked> ✗ wrong</label>
+    </div>
+
+    <label>What should it have been?</label>
+    <select name="suggested">
+      <option value="">(leave blank if it was correct)</option>
+      {% for f in folders %}
+        <option value="{{ f.id or f.name }}" {% if (f.id or f.name) == decision.verdict_folder %}disabled{% endif %}>{{ f.name }}</option>
+      {% endfor %}
+    </select>
+    <div class="help">Required if you picked ✗ wrong.</div>
+
+    <label>Why? (your reasoning helps the next taxonomy update)</label>
+    <textarea name="note" placeholder="e.g. 'sender is internal; thread is about a renewal contract; should always be high-priority not medium'"></textarea>
+
+    <button type="submit">Submit feedback</button>
+  </form>
+</div>
+</body>
+"""
+
+_FEEDBACK_DONE_HTML = """\
+<!doctype html><meta charset="utf-8"><title>{{ title }} — email-engine</title>
+<style>
+  body { font: 15px/1.5 -apple-system, system-ui, Segoe UI, sans-serif;
+         margin: 0; padding: 0; background: #f6f7fb; color: #222; }
+  .card { max-width: 480px; margin: 6rem auto; background: #fff;
+          border-radius: 12px; padding: 28px 32px;
+          box-shadow: 0 1px 3px rgba(0,0,0,.04), 0 8px 24px rgba(0,0,0,.06); }
+  h1 { font-size: 1.1rem; margin: 0 0 12px; color: #333; }
+  p  { color: #555; margin: 0; }
+</style>
+<body><div class="card"><h1>{{ title }}</h1><p>{{ body }}</p></div></body>
 """
 
 

@@ -290,6 +290,43 @@ class GraphProvider(Provider):
         endpoint = f"{GRAPH_API_BASE}/users/{quote(self._email)}/messages/{quote(message_id, safe='')}"
         _do_json(self._broker, "PATCH", endpoint, body={"categories": categories})
 
+    def append_to_body(
+        self, message_id: str, *, html_snippet: str, text_snippet: str,
+    ) -> bool:
+        """GET current body + contentType, append the matching snippet,
+        PATCH back. Best-effort: returns False (and logs) on any Graph
+        error so the poller continues even if a message can't be modified
+        (rare: messages stuck in remote folders, message moved out from
+        under us between cycles, etc.)."""
+        endpoint = (
+            f"{GRAPH_API_BASE}/users/{quote(self._email)}"
+            f"/messages/{quote(message_id, safe='')}"
+        )
+        try:
+            data = _do_json(self._broker, "GET", endpoint + "?$select=body") or {}
+        except Exception as e:
+            log.warning("[%s] append_to_body GET failed for %s: %s",
+                        self._email, message_id[:24], e)
+            return False
+        body = data.get("body") or {}
+        content_type = (body.get("contentType") or "html").lower()
+        content = body.get("content") or ""
+
+        if content_type == "html":
+            new_content = _append_html_footer(content, html_snippet)
+        else:
+            new_content = (content.rstrip() + "\n\n" + text_snippet).strip()
+
+        try:
+            _do_json(self._broker, "PATCH", endpoint, body={
+                "body": {"contentType": content_type, "content": new_content},
+            })
+            return True
+        except Exception as e:
+            log.warning("[%s] append_to_body PATCH failed for %s: %s",
+                        self._email, message_id[:24], e)
+            return False
+
     def ensure_master_categories(self, names: list[str]) -> dict:
         """Register `names` in Outlook's Master Category List so they show
         up in the categories management UI / picker (and render with the
@@ -457,6 +494,21 @@ _HTML_ENTITIES = [
     ("&nbsp;", " "), ("&amp;", "&"), ("&lt;", "<"),
     ("&gt;", ">"), ("&quot;", '"'), ("&#39;", "'"),
 ]
+
+
+def _append_html_footer(original: str, footer_html: str) -> str:
+    """Insert `footer_html` just before </body> if a body tag exists,
+    else append at the end. Idempotent: if the footer's sentinel class
+    is already present in the message, leave the message untouched
+    (protects against double-injection if a reclassify re-runs over a
+    message we already touched)."""
+    if "ee2-feedback-footer" in original:
+        return original
+    lower = original.lower()
+    idx = lower.rfind("</body>")
+    if idx != -1:
+        return original[:idx] + footer_html + original[idx:]
+    return original + footer_html
 
 
 def _strip_html(h: str) -> str:

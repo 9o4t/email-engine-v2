@@ -136,6 +136,41 @@ CREATE TABLE IF NOT EXISTS thread_summaries (
     PRIMARY KEY (mailbox, thread_key)
 );
 CREATE INDEX IF NOT EXISTS idx_ts_last_message_at ON thread_summaries(last_message_at);
+
+-- One-shot feedback tokens. Minted at injection time and embedded in
+-- the footer link of an inbound email. Stored as sha256(token) so a
+-- DB leak doesn't expose live tokens. Single-use (consumed on submit)
+-- and expires after 30 days. The token IS the auth for /f/<token> —
+-- no other credentials are required to view or submit feedback.
+CREATE TABLE IF NOT EXISTS feedback_tokens (
+    token_hash      TEXT PRIMARY KEY,         -- sha256 hex of the URL token
+    decision_id     TEXT NOT NULL,            -- decisions.id this token gives feedback on
+    mailbox         TEXT NOT NULL,
+    created_at      TEXT NOT NULL,
+    expires_at      TEXT NOT NULL,
+    used_at         TEXT,                      -- NULL until consumed; non-null = spent
+    feedback_id     TEXT                       -- feedback.id created on consumption
+);
+CREATE INDEX IF NOT EXISTS idx_feedback_tokens_decision ON feedback_tokens(decision_id);
+
+-- LLM-proposed taxonomy edits derived from accumulated feedback.
+-- Stored so the user can review the suggestion before applying it
+-- (which writes the JSON to /data/hierarchies/<mailbox>.json — the
+-- persistent override that takes precedence over the in-repo file).
+CREATE TABLE IF NOT EXISTS taxonomy_proposals (
+    id              TEXT PRIMARY KEY,
+    mailbox         TEXT NOT NULL,
+    created_at      TEXT NOT NULL,
+    based_on_feedback_count INTEGER NOT NULL,
+    current_json    TEXT NOT NULL,           -- snapshot of taxonomy at proposal time
+    proposed_json   TEXT NOT NULL,           -- LLM's suggested replacement
+    rationale       TEXT,                    -- LLM's per-change reasoning
+    llm_raw         TEXT,                    -- full LLM reply for debugging
+    applied_at      TEXT,                    -- non-null = user applied it
+    discarded_at    TEXT                     -- non-null = user discarded it
+);
+CREATE INDEX IF NOT EXISTS idx_taxonomy_proposals_mailbox
+    ON taxonomy_proposals(mailbox, created_at DESC);
 """
 
 
@@ -529,6 +564,133 @@ class Store:
                 (mailbox, conversation_id),
             ).fetchall()
         return [dict(r) for r in rows]
+
+    # --- feedback_tokens (one-shot URLs injected into email bodies) --------
+
+    def mint_feedback_token(
+        self, *, decision_id: str, mailbox: str, ttl_days: int = 30,
+    ) -> str:
+        """Generate a new opaque token, persist sha256(token), and return
+        the RAW token for embedding in the URL. The plaintext token is
+        never written to disk — only its hash is stored."""
+        import secrets, hashlib
+        from datetime import timedelta
+        token = secrets.token_urlsafe(24)
+        token_hash = hashlib.sha256(token.encode("ascii")).hexdigest()
+        now = datetime.now(timezone.utc)
+        expires = (now + timedelta(days=ttl_days)).isoformat()
+        with self._conn() as c:
+            c.execute(
+                """INSERT INTO feedback_tokens
+                   (token_hash, decision_id, mailbox, created_at, expires_at)
+                   VALUES (?, ?, ?, ?, ?)""",
+                (token_hash, decision_id, mailbox, now.isoformat(), expires),
+            )
+        return token
+
+    def validate_feedback_token(self, token: str) -> dict | None:
+        """Return {decision_id, mailbox, used_at, expires_at} for a token
+        that exists, has not expired, and has not been consumed.
+        Returns None on any failure mode (caller renders the same
+        friendly 'this link is no longer valid' page either way)."""
+        if not token:
+            return None
+        import hashlib
+        h = hashlib.sha256(token.encode("ascii")).hexdigest()
+        with self._conn() as c:
+            row = c.execute(
+                """SELECT decision_id, mailbox, expires_at, used_at
+                   FROM feedback_tokens WHERE token_hash = ?""",
+                (h,),
+            ).fetchone()
+        if not row:
+            return None
+        if row["used_at"]:
+            return None
+        try:
+            exp = datetime.fromisoformat(row["expires_at"])
+            if exp <= datetime.now(timezone.utc):
+                return None
+        except ValueError:
+            return None
+        return {
+            "decision_id": row["decision_id"],
+            "mailbox":     row["mailbox"],
+            "expires_at":  row["expires_at"],
+        }
+
+    def consume_feedback_token(self, token: str, feedback_id: str) -> bool:
+        """Mark the token as used, attaching the feedback row it created.
+        Returns False if the token was already consumed in a race with
+        another submission (rare — same user double-clicking)."""
+        import hashlib
+        h = hashlib.sha256(token.encode("ascii")).hexdigest()
+        now = datetime.now(timezone.utc).isoformat()
+        with self._conn() as c:
+            cur = c.execute(
+                """UPDATE feedback_tokens
+                   SET used_at = ?, feedback_id = ?
+                   WHERE token_hash = ? AND used_at IS NULL""",
+                (now, feedback_id, h),
+            )
+        return cur.rowcount > 0
+
+    # --- taxonomy_proposals (LLM-suggested hierarchy edits) ----------------
+
+    def insert_taxonomy_proposal(
+        self, *, mailbox: str, based_on_feedback_count: int,
+        current_json: str, proposed_json: str,
+        rationale: str | None, llm_raw: str | None,
+    ) -> str:
+        pid = str(uuid.uuid4())
+        now = datetime.now(timezone.utc).isoformat()
+        with self._conn() as c:
+            c.execute(
+                """INSERT INTO taxonomy_proposals
+                   (id, mailbox, created_at, based_on_feedback_count,
+                    current_json, proposed_json, rationale, llm_raw)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                (pid, mailbox, now, based_on_feedback_count,
+                 current_json, proposed_json, rationale, llm_raw),
+            )
+        return pid
+
+    def get_taxonomy_proposal(self, proposal_id: str) -> dict | None:
+        with self._conn() as c:
+            row = c.execute(
+                "SELECT * FROM taxonomy_proposals WHERE id = ?", (proposal_id,),
+            ).fetchone()
+        return dict(row) if row else None
+
+    def list_taxonomy_proposals(
+        self, mailbox: str | None = None, limit: int = 50,
+    ) -> list[dict]:
+        with self._conn() as c:
+            if mailbox:
+                rows = c.execute(
+                    """SELECT * FROM taxonomy_proposals WHERE mailbox = ?
+                       ORDER BY created_at DESC LIMIT ?""",
+                    (mailbox, limit),
+                ).fetchall()
+            else:
+                rows = c.execute(
+                    """SELECT * FROM taxonomy_proposals
+                       ORDER BY created_at DESC LIMIT ?""", (limit,),
+                ).fetchall()
+        return [dict(r) for r in rows]
+
+    def mark_taxonomy_proposal(
+        self, proposal_id: str, *, applied: bool, discarded: bool,
+    ) -> None:
+        now = datetime.now(timezone.utc).isoformat()
+        col = "applied_at" if applied else "discarded_at" if discarded else None
+        if not col:
+            return
+        with self._conn() as c:
+            c.execute(
+                f"UPDATE taxonomy_proposals SET {col} = ? WHERE id = ?",
+                (now, proposal_id),
+            )
 
     # --- thread_summaries (one row per (mailbox, thread_key)) --------------
 

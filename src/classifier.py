@@ -42,10 +42,33 @@ HIERARCHY_DIR = Path(__file__).parent / "data" / "hierarchies"
 DEFAULT_HIERARCHY = HIERARCHY_DIR / "_default.json"
 PROMPT_DIR = Path(__file__).parent / "data" / "prompts"
 
+# Persistent override location — LLM-proposed taxonomy edits land here
+# so they survive container redeploys. Takes precedence over the
+# in-repo file when present. Defaults to /data/hierarchies (Railway
+# volume mount); override with HIERARCHY_OVERRIDE_DIR if you've put the
+# SQLite DB somewhere else.
+HIERARCHY_OVERRIDE_DIR = Path(
+    os.getenv("HIERARCHY_OVERRIDE_DIR", "/data/hierarchies")
+)
+
 
 def hierarchy_path_for(mailbox: str) -> Path:
-    p = HIERARCHY_DIR / f"{sanitize_mailbox(mailbox)}.json"
+    """Resolution order: persistent override file → in-repo per-mailbox
+    file → in-repo default. The override lets the user accept an LLM-
+    proposed taxonomy change without redeploying; nothing else writes
+    to that directory."""
+    stem = sanitize_mailbox(mailbox)
+    override = HIERARCHY_OVERRIDE_DIR / f"{stem}.json"
+    if override.exists():
+        return override
+    p = HIERARCHY_DIR / f"{stem}.json"
     return p if p.exists() else DEFAULT_HIERARCHY
+
+
+def hierarchy_override_path(mailbox: str) -> Path:
+    """Where applied taxonomy proposals get written. Parent dir is
+    created on first write — not at import time."""
+    return HIERARCHY_OVERRIDE_DIR / f"{sanitize_mailbox(mailbox)}.json"
 
 
 def prompt_path_for(mailbox: str) -> Path | None:

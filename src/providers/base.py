@@ -181,6 +181,19 @@ class Provider(ABC):
             progress.update(out)
         return out
 
+    def append_to_body(
+        self, message_id: str, *, html_snippet: str, text_snippet: str,
+    ) -> bool:
+        """Append a snippet to the message body in place. The HTML snippet
+        is used when the message body is already HTML; the text snippet
+        otherwise. Used to inject the feedback footer on inbound mail
+        after classification.
+
+        Returns True on success, False on failure (caller logs but does
+        not retry — feedback is best-effort, never blocks classification).
+        Default no-op for providers that can't mutate body in place."""
+        return False
+
     def ensure_master_categories(self, names: list[str]) -> dict:
         """Register tag names in the provider's master / canonical category
         list so they show up in the client UI's category management view
