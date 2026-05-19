@@ -1140,6 +1140,85 @@ def reclassify_status(email: str):
     return jsonify({"running": False, "progress": None})
 
 
+# --- Sync Outlook Master Category List --------------------------------------
+
+# In-memory cache of the most recent sync result per mailbox so the
+# /mailboxes page can show "last sync: created 5, errors 0" inline.
+_master_cats_last_sync: dict[str, dict] = {}
+
+
+@app.post("/mailboxes/<path:email>/sync-categories")
+@_require_auth
+def mailboxes_sync_categories(email: str):
+    """One-click force-sync of Outlook's Master Category List for one
+    mailbox. Runs synchronously, captures created/existed/errors counts
+    + actual error messages so a Graph permission failure is visible in
+    the UI banner (instead of dying silently in poller logs the way the
+    on-poll auto-sync does).
+
+    Common failure mode this surfaces: Graph app permission is
+    `Mail.ReadWrite` only — that's enough for set_categories on
+    messages, but the master list itself requires
+    `MailboxSettings.ReadWrite`. The 403 from masterCategories shows up
+    in the result banner with the exact remediation."""
+    from providers import make_provider
+    from classifier import list_folders
+
+    mb = store.get_mailbox(email)
+    if not mb:
+        abort(404, "unknown mailbox")
+    if mb.provider != "graph":
+        return Response(status=303, headers={
+            "Location": "/mailboxes?msg=sync-categories-noop",
+        })
+
+    try:
+        provider = make_provider(
+            mb.mailbox, mb.provider,
+            imap_server=mb.imap_server, imap_port=mb.imap_port,
+        )
+    except Exception as e:
+        _master_cats_last_sync[email] = {
+            "ok": False, "ran_at": _now_iso(),
+            "created": 0, "existed": 0, "errors": 1,
+            "error_messages": [f"provider construction failed: {e}"],
+            "existing_names": [], "registered_names": [],
+        }
+        return Response(status=303, headers={
+            "Location": "/mailboxes?msg=sync-categories-failed",
+        })
+
+    current_categories = [f["id"] or f["name"] for f in list_folders(mb.mailbox)]
+
+    # Force re-sync: clear the per-process "already synced" cache so the
+    # on-poll auto-sync also retries on its next cycle (in case the
+    # operator just updated Graph app permissions in Azure).
+    try:
+        from poller import _MASTER_CATS_SYNCED
+        _MASTER_CATS_SYNCED.discard(email)
+    except Exception:
+        pass
+
+    result = provider.ensure_master_categories(current_categories)
+    result["ran_at"] = _now_iso()
+    result["ok"] = result.get("errors", 0) == 0
+    _master_cats_last_sync[email] = result
+    return Response(status=303, headers={
+        "Location": "/mailboxes?msg=sync-categories-done",
+    })
+
+
+@app.get("/api/mailboxes/<path:email>/sync-categories/last")
+@_require_auth
+def mailboxes_sync_categories_last(email: str):
+    """JSON read of the most recent sync result. 404 if no sync has
+    been attempted in this process. Used by the per-card status JS."""
+    r = _master_cats_last_sync.get(email)
+    if not r:
+        return jsonify({"error": "never_run", "mailbox": email}), 404
+    return jsonify({"mailbox": email, **r})
+
+
 # --- Sweep folder → Inbox ---------------------------------------------------
 
 @app.post("/mailboxes/<path:email>/sweep-to-inbox")
@@ -2197,6 +2276,12 @@ _MAILBOXES_HTML = """\
   <div class="banner">Paused {{ request.args.get('n', '?') }} mailbox(es). All polling stops next cycle.</div>
 {% elif request.args.get('msg') == 'resumed-all' %}
   <div class="banner ok">Resumed {{ request.args.get('n', '?') }} mailbox(es).</div>
+{% elif request.args.get('msg') == 'sync-categories-done' %}
+  <div class="banner ok">Category sync attempted. See per-mailbox status below for created / existed / errors counts.</div>
+{% elif request.args.get('msg') == 'sync-categories-failed' %}
+  <div class="banner">Category sync failed before it could call Graph. See per-mailbox status below.</div>
+{% elif request.args.get('msg') == 'sync-categories-noop' %}
+  <div class="banner">Sync skipped — only Graph (Microsoft 365) mailboxes have a Master Category List.</div>
 {% endif %}
 
 {% set active_mbs = mailboxes|selectattr('enabled')|list %}
@@ -2332,6 +2417,14 @@ _MAILBOXES_HTML = """\
         </div>
       </details>
       <a class="btn sm" href="/hierarchies/{{ m.mailbox }}">View taxonomy</a>
+      {% if m.provider == 'graph' %}
+      <form method="post" action="/mailboxes/{{ m.mailbox }}/sync-categories" style="display:inline">
+        <button type="submit" class="btn sm"
+                title="Register the verdict tags (1-Critical … 5-Low-Ignore) in Outlook's Master Category List with colors. Idempotent. Required for the tags to show up in Outlook → Settings → Categories and to render with color.">
+          ⊕ Sync categories
+        </button>
+      </form>
+      {% endif %}
       <details>
         <summary><button type="button" class="btn sm">Sweep folder → Inbox</button></summary>
         <div class="details-body">
@@ -2352,6 +2445,7 @@ _MAILBOXES_HTML = """\
     </div>
 
     <div class="sweep-status" id="sweep-status-{{ m.mailbox }}"></div>
+    <div class="sweep-status" id="sync-cats-status-{{ m.mailbox }}" style="margin-top: 4px;"></div>
 
     <div class="reclass" id="reclass-{{ m.mailbox }}">
       <div class="top">
@@ -2478,10 +2572,39 @@ _MAILBOXES_HTML = """\
     else     { el.textContent = ''; el.classList.remove('show'); }
   }
 
+  function fmtSyncCats(s) {
+    if (!s || s.error === 'never_run') return '';
+    var when = s.ran_at ? s.ran_at.slice(11, 19) : '';
+    var existing = (s.existing_names && s.existing_names.length)
+      ? ' · ' + s.existing_names.length + ' pre-existing in Outlook'
+      : '';
+    if (s.errors && s.errors > 0) {
+      var errs = (s.error_messages || []).join(' · ');
+      return '✗ category sync (' + when + ') errors=' + s.errors + ' — ' + errs;
+    }
+    var regs = (s.registered_names || []);
+    var regsStr = regs.length ? ' (new: ' + regs.join(', ') + ')' : '';
+    return '✓ category sync (' + when + '): created=' + (s.created||0) + ', existed=' + (s.existed||0) + regsStr + existing;
+  }
+
+  function renderSyncCats(mb, s) {
+    var el = document.getElementById('sync-cats-status-' + mb);
+    if (!el) return;
+    var txt = fmtSyncCats(s);
+    if (txt) {
+      el.textContent = txt;
+      el.style.color = (s && s.errors > 0) ? '#b32626' : '#196b3a';
+      el.classList.add('show');
+    } else {
+      el.textContent = '';
+      el.classList.remove('show');
+    }
+  }
+
   var pollMs = 8000;
   function tick() {
     var anyRunning = false;
-    var pending = mailboxes.length * 2;
+    var pending = mailboxes.length * 3;
     if (!pending) { setTimeout(tick, pollMs); return; }
     mailboxes.forEach(function(mb) {
       fetch('/api/reclassify/' + encodeURIComponent(mb) + '/status')
@@ -2492,6 +2615,12 @@ _MAILBOXES_HTML = """\
       fetch('/api/sweep/' + encodeURIComponent(mb) + '/status')
         .then(function(r){ return r.ok ? r.json() : null; })
         .then(function(j){ renderSweep(mb, j); if (j && j.running) anyRunning = true; })
+        .catch(function(){})
+        .finally(function(){ if (--pending === 0) { pollMs = anyRunning ? 2000 : 8000; setTimeout(tick, pollMs); } });
+      // 404 here is normal (sync never attempted in this process).
+      fetch('/api/mailboxes/' + encodeURIComponent(mb) + '/sync-categories/last')
+        .then(function(r){ return r.ok ? r.json() : null; })
+        .then(function(j){ if (j) renderSyncCats(mb, j); })
         .catch(function(){})
         .finally(function(){ if (--pending === 0) { pollMs = anyRunning ? 2000 : 8000; setTimeout(tick, pollMs); } });
     });

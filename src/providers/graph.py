@@ -339,17 +339,38 @@ class GraphProvider(Provider):
 
         Idempotent: GETs the existing list once, POSTs only missing
         names. Color is auto-derived from the leading digit of the name
-        (matches the dashboard's verdict color buckets)."""
+        (matches the dashboard's verdict color buckets).
+
+        Returns a dict with counts AND error messages so a Graph
+        permission failure (commonly: app doesn't have the
+        MailboxSettings.ReadWrite scope, which is REQUIRED for this
+        endpoint even though Mail.ReadWrite is enough for messages +
+        folders) surfaces visibly instead of dying in logs."""
         endpoint = (
             f"{GRAPH_API_BASE}/users/{quote(self._email)}/outlook/masterCategories"
         )
-        out = {"created": 0, "existed": 0, "errors": 0}
+        out: dict = {
+            "created": 0, "existed": 0, "errors": 0,
+            "error_messages": [],
+            "existing_names": [],
+            "registered_names": [],
+        }
         try:
             data = _do_json(self._broker, "GET", endpoint) or {}
-            existing = {c.get("displayName") for c in data.get("value", [])}
+            existing_list = [c.get("displayName") for c in data.get("value", [])
+                             if c.get("displayName")]
+            existing = set(existing_list)
+            out["existing_names"] = existing_list
         except Exception as e:
-            log.warning("[%s] masterCategories GET failed: %s", self._email, e)
+            msg = (
+                f"GET /outlook/masterCategories failed: {e}. "
+                "If this is a 403 / Forbidden, the Graph app needs the "
+                "'MailboxSettings.ReadWrite' application permission — "
+                "Mail.ReadWrite alone doesn't cover the master category list."
+            )
+            log.warning("[%s] %s", self._email, msg)
             out["errors"] += 1
+            out["error_messages"].append(msg)
             return out
         for name in names:
             if not name:
@@ -361,15 +382,18 @@ class GraphProvider(Provider):
             try:
                 _do_json(self._broker, "POST", endpoint, body=body)
                 out["created"] += 1
+                out["registered_names"].append(name)
                 log.info(
                     "[%s] registered master category %r color=%s",
                     self._email, name, body["color"],
                 )
             except Exception as e:
+                msg = f"POST {name!r}: {e}"
                 log.exception(
-                    "[%s] masterCategories POST %s: %s", self._email, name, e,
+                    "[%s] masterCategories %s", self._email, msg,
                 )
                 out["errors"] += 1
+                out["error_messages"].append(msg)
         return out
 
     def move_message(self, message_id: str, dest_folder: str) -> str:
