@@ -455,9 +455,14 @@ class GraphProvider(Provider):
         }
 
         # 1) List current search folders WITH their config so we can
-        # detect drift on the ones that already exist.
+        # detect drift on the ones that already exist. Everything under
+        # the `searchfolders` parent is by definition a mailSearchFolder
+        # (Graph won't let you create regular folders there), so no
+        # @odata.type filter is needed. Note: Graph rejects @odata.type
+        # in $select with a 400 BadRequest — it's an annotation, not a
+        # property — so don't add it back.
         try:
-            select = ("id,displayName,@odata.type,filterQuery,"
+            select = ("id,displayName,filterQuery,"
                       "sourceFolderIds,includeNestedFolders")
             data = _do_json(
                 self._broker, "GET",
@@ -465,10 +470,6 @@ class GraphProvider(Provider):
             ) or {}
             existing_folders: dict[str, dict] = {}
             for f in data.get("value", []):
-                # Only consider actual search folders — won't molest
-                # regular folders the user happened to name the same.
-                if "mailSearchFolder" not in (f.get("@odata.type") or ""):
-                    continue
                 disp = f.get("displayName")
                 if disp:
                     existing_folders[disp] = f
