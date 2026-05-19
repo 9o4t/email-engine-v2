@@ -257,19 +257,193 @@ def healthz():
 
 # --- Decisions / Feedback ---------------------------------------------------
 
+def _sidebar_data(current_mailbox: str = "") -> dict:
+    """Compute the sidebar payload (mailbox list + per-hour counts +
+    pending-proposal count) every page needs. Single SQL pass per
+    counter so /overview still renders in ~10ms on a multi-million-row
+    decisions table."""
+    mailboxes = store.list_mailboxes()
+    counts: dict[str, int] = {}
+    pending = 0
+    try:
+        with store._conn() as c:
+            for r in c.execute(
+                """SELECT mailbox, COUNT(*) AS n FROM decisions
+                   WHERE created_at >= datetime('now', '-1 hours')
+                   GROUP BY mailbox""").fetchall():
+                counts[r["mailbox"]] = int(r["n"])
+            pending = int(c.execute(
+                """SELECT COUNT(*) AS n FROM taxonomy_proposals
+                   WHERE applied_at IS NULL AND discarded_at IS NULL"""
+            ).fetchone()["n"])
+    except sqlite3.Error:
+        pass
+    total_hr = sum(counts.values())
+    return {
+        "mailboxes": mailboxes,
+        "counts": counts,
+        "total_hr": total_hr,
+        "current": current_mailbox or "",
+        "pending_proposals": pending,
+    }
+
+
+def _overview_data(mailbox: str | None = None) -> dict:
+    """Aggregate the overview screen's stat cards, 24h sparkline, verdict
+    mix, and recent decisions in a single helper. Per-hour bucketing
+    uses SQLite's strftime so a 24h window is one query."""
+    from datetime import datetime as _dt, timezone as _tz, timedelta
+    now = _dt.now(_tz.utc)
+    today_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+
+    mb_clause = ""
+    args: list = []
+    if mailbox:
+        mb_clause = " AND mailbox = ?"
+        args.append(mailbox)
+
+    with store._conn() as c:
+        # Classified today + yesterday (for delta)
+        classified_today = int(c.execute(
+            f"SELECT COUNT(*) AS n FROM decisions WHERE created_at >= ?{mb_clause}",
+            (today_start.isoformat(), *args),
+        ).fetchone()["n"])
+        y_start = (today_start - timedelta(days=1)).isoformat()
+        y_end = today_start.isoformat()
+        classified_y = int(c.execute(
+            f"SELECT COUNT(*) AS n FROM decisions WHERE created_at >= ? AND created_at < ?{mb_clause}",
+            (y_start, y_end, *args),
+        ).fetchone()["n"])
+
+        # Apply errors in last 24h
+        apply_errors = int(c.execute(
+            f"""SELECT COUNT(*) AS n FROM decisions
+                WHERE apply_error IS NOT NULL AND apply_error != ''
+                  AND created_at >= datetime('now', '-24 hours'){mb_clause}""",
+            tuple(args),
+        ).fetchone()["n"])
+
+        # Avg latency (seconds) over last 24h
+        latency_row = c.execute(
+            f"""SELECT AVG((julianday(created_at) - julianday(retrieved)) * 86400.0) AS s
+                FROM decisions
+                WHERE retrieved IS NOT NULL
+                  AND created_at >= datetime('now', '-24 hours'){mb_clause}""",
+            tuple(args),
+        ).fetchone()
+        avg_latency = float(latency_row["s"]) if latency_row and latency_row["s"] is not None else None
+
+        # Per-hour 24h activity + verdict counts
+        rows_24h = c.execute(
+            f"""SELECT created_at, verdict_folder FROM decisions
+                WHERE created_at >= datetime('now', '-24 hours'){mb_clause}""",
+            tuple(args),
+        ).fetchall()
+
+    buckets = [0] * 24
+    verdict_counts: dict[str, int] = {"1": 0, "2": 0, "3": 0, "4": 0, "5": 0}
+    for r in rows_24h:
+        try:
+            ts = r["created_at"]
+            if ts.endswith("Z"):
+                ts = ts.replace("Z", "+00:00")
+            dt = datetime.fromisoformat(ts)
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            hours_ago = int((now - dt).total_seconds() // 3600)
+            if 0 <= hours_ago < 24:
+                buckets[23 - hours_ago] += 1
+        except (ValueError, AttributeError):
+            pass
+        v = (r["verdict_folder"] or "")
+        for ch in v:
+            if ch.isdigit():
+                if ch in verdict_counts:
+                    verdict_counts[ch] += 1
+                break
+
+    # Mailbox active/total
+    all_mb = store.list_mailboxes()
+    active_n = sum(1 for m in all_mb if m.enabled)
+    total_n = len(all_mb)
+
+    # Delta vs. yesterday-by-this-time. Use full-day yesterday as baseline
+    # to avoid noisy comparisons against very-early-morning windows.
+    if classified_y > 0:
+        delta_pct = ((classified_today - classified_y) / classified_y) * 100
+    else:
+        delta_pct = None
+
+    recent = store.recent_decisions(mailbox=mailbox, limit=6)
+
+    return {
+        "classified_today": classified_today,
+        "delta_pct": delta_pct,
+        "apply_errors": apply_errors,
+        "avg_latency": avg_latency,
+        "active_n": active_n,
+        "total_n": total_n,
+        "paused_n": total_n - active_n,
+        "activity_24h": buckets,
+        "activity_24h_max": max(buckets) if buckets and max(buckets) > 0 else 1,
+        "verdict_counts": verdict_counts,
+        "verdict_total": sum(verdict_counts.values()),
+        "recent": recent,
+    }
+
+
+def _dashboard_render(body_template: str, *, active_tab: str,
+                      page_title: str = "email-engine v2",
+                      current_mailbox: str = "",
+                      **ctx) -> str:
+    """Compose the shared sidebar shell + a per-page body template, then
+    render. Every authenticated dashboard page goes through this; the
+    public feedback landing pages render their own standalone HTML."""
+    tpl = _SHELL_HEAD + body_template + _SHELL_FOOT
+    return render_template_string(
+        tpl,
+        active_tab=active_tab,
+        page_title=page_title,
+        sidebar=_sidebar_data(current_mailbox),
+        **ctx,
+    )
+
+
 @app.get("/")
 @_require_auth
 def index():
+    """Overview screen — stat cards, 24h sparkline, verdict mix, and the
+    six most-recent classifications. The decisions list moved to
+    /decisions when this became the landing page."""
+    mailbox = request.args.get("mailbox") or None
+    data = _overview_data(mailbox)
+    return _dashboard_render(
+        _OVERVIEW_HTML,
+        active_tab="overview",
+        page_title="Overview",
+        current_mailbox=mailbox or "",
+        data=data,
+        mailbox=mailbox or "",
+    )
+
+
+@app.get("/decisions")
+@_require_auth
+def decisions_view():
+    """Full decisions list. This is what `/` used to render before the
+    overview screen took the landing spot."""
     mailbox = request.args.get("mailbox") or None
     limit = int(request.args.get("limit", "100"))
     rows = store.recent_decisions(mailbox=mailbox, limit=limit)
     folders = list_folders(mailbox or "_default")
-    return render_template_string(
+    return _dashboard_render(
         _DECISIONS_HTML,
-        rows=rows,
-        mailboxes=[m.mailbox for m in store.list_mailboxes()],
+        active_tab="decisions",
+        page_title="Decisions",
         current_mailbox=mailbox or "",
+        rows=rows,
         folders=folders,
+        limit=limit,
     )
 
 
@@ -424,11 +598,12 @@ def threads_view():
             )
         rows.sort(key=sort_key)
 
-    return render_template_string(
+    return _dashboard_render(
         _THREADS_HTML,
-        rows=rows,
-        mailboxes=[m.mailbox for m in store.list_mailboxes()],
+        active_tab="threads",
+        page_title="Threads",
         current_mailbox=mailbox or "",
+        rows=rows,
         limit=limit,
         group_by=group_by,
         group_counts=group_counts,
@@ -459,8 +634,11 @@ def thread_detail(conversation_id: str):
                       apply_error, body_preview
                FROM decisions WHERE mailbox = ? AND conversation_id = ?
                ORDER BY created_at ASC""", (mailbox, conversation_id)).fetchall()]
-    return render_template_string(
+    return _dashboard_render(
         _THREAD_DETAIL_HTML,
+        active_tab="threads",
+        page_title="Thread",
+        current_mailbox=mailbox,
         mailbox=mailbox,
         conversation_id=conversation_id,
         history=history,
@@ -477,11 +655,12 @@ def changes_view():
     only_changes = request.args.get("changes_only", "1") == "1"
     limit = int(request.args.get("limit", "200"))
     rows = store.list_thread_changes(mailbox=mailbox, only_changes=only_changes, limit=limit)
-    return render_template_string(
+    return _dashboard_render(
         _CHANGES_HTML,
-        rows=rows,
-        mailboxes=[m.mailbox for m in store.list_mailboxes()],
+        active_tab="changes",
+        page_title="Changes",
         current_mailbox=mailbox or "",
+        rows=rows,
         only_changes=only_changes,
         limit=limit,
     )
@@ -750,8 +929,10 @@ def decisions_json():
 @app.get("/mailboxes")
 @_require_auth
 def mailboxes_list():
-    return render_template_string(
+    return _dashboard_render(
         _MAILBOXES_HTML,
+        active_tab="mailboxes",
+        page_title="Mailboxes",
         mailboxes=store.list_mailboxes(),
         apply_modes=APPLY_MODES,
         profiles=MAILBOX_PROFILES,
@@ -1052,804 +1233,15 @@ def hierarchy_view(email: str):
         data = json.loads(path.read_text(encoding="utf-8"))
     except Exception as e:
         return Response(f"Cannot read {path}: {e}", status=500)
-    return render_template_string(_HIERARCHY_HTML, mailbox=email, path=str(path), data=data)
-
-
-# --- Templates --------------------------------------------------------------
-
-_NAV = """\
-<nav style="margin: 0 0 1rem; font-size: 0.9rem;">
-  <a href="/">Decisions</a> ·
-  <a href="/threads">Threads</a> ·
-  <a href="/changes">Changes</a> ·
-  <a href="/feedback-review">Feedback</a> ·
-  <a href="/test-classify">Test</a> ·
-  <a href="/mailboxes">Mailboxes</a> ·
-  <a href="/admin/db.sqlite">Download DB</a> ·
-  <a href="/api/feedback.csv">Feedback CSV</a> ·
-  <a href="/api/decisions.csv">Decisions CSV</a>
-</nav>
-"""
-
-_VERDICT_CSS = """\
-<style>
-  /* Verdict color buckets. Use these by adding the v1/v2/.../vu class
-     to a .verdict span. Same color regardless of underscore-prefix or
-     -X suffix variants — the verdict_class filter normalizes them. */
-  .verdict.v1 { background: #ffe1e1; color: #7a1212; border: 1px solid #d04040; }
-  .verdict.v2 { background: #ffe5cf; color: #7a3f00; border: 1px solid #e07a1f; }
-  .verdict.v3 { background: #e6dcff; color: #3f1e7a; border: 1px solid #7e57c2; }
-  .verdict.v4 { background: #fff3c8; color: #5e4a00; border: 1px solid #d4a82a; }
-  .verdict.v5 { background: #d8eede; color: #1e5232; border: 1px solid #5c9b76; }
-  .verdict.vu { background: #ececf0; color: #555;    border: 1px solid #b6b6bd; }
-  .verdict { font-family: ui-monospace, "Cascadia Mono", Menlo, monospace;
-             font-size: 0.78rem; font-weight: 600; padding: 2px 8px;
-             border-radius: 999px; letter-spacing: 0.2px; white-space: nowrap; }
-  /* Section header rows on grouped tables */
-  tr.grouphdr td { background: #f5f5f8; font-weight: 700; padding: 10px 8px;
-                   border-top: 2px solid #d6d6dc; border-bottom: 1px solid #d6d6dc; }
-  tr.grouphdr .group-count { font-weight: 400; color: #777; margin-left: 8px; font-size: 0.85rem; }
-</style>
-<style media="(prefers-color-scheme: dark)">
-  .verdict.v1 { background: #4a1d1d !important; color: #ffb3b3 !important; border-color: #7a3a3a !important; }
-  .verdict.v2 { background: #3a2510 !important; color: #ffc798 !important; border-color: #6a4520 !important; }
-  .verdict.v3 { background: #2a1f4a !important; color: #cbb6ff !important; border-color: #5a4a98 !important; }
-  .verdict.v4 { background: #3a2f10 !important; color: #ffdc80 !important; border-color: #6a5520 !important; }
-  .verdict.v5 { background: #1f3025 !important; color: #b3d8c4 !important; border-color: #3a6045 !important; }
-  .verdict.vu { background: #2a2c34 !important; color: #c0c2c8 !important; border-color: #4a4d55 !important; }
-  tr.grouphdr td { background: #1c1f26 !important; border-top-color: #2c2f36 !important; border-bottom-color: #2c2f36 !important; color: #d6d8dd !important; }
-  tr.grouphdr .group-count { color: #98989f !important; }
-</style>
-"""
-
-
-# Single dark-mode override block prepended to every page. Uses
-# prefers-color-scheme so it follows your OS setting (no manual toggle —
-# add one later if you find yourself flipping between modes a lot).
-# Defined via CSS variables so the existing per-template inline styles
-# can stay as-is; this block just retints body, tables, inputs, links,
-# code, pre, banners, and pills.
-_DARK_MODE_CSS = """\
-<style>
-@media (prefers-color-scheme: dark) {
-  body { background: #15171b !important; color: #e6e6e9 !important; }
-  .reclass-card { background: #1c1f26 !important; border-color: #2c2f36 !important; }
-  .reclass-card table.metrics th { color: #b5b7be !important; }
-  .reclass-card table.metrics th,
-  .reclass-card table.metrics td { border-bottom-color: #2c2f36 !important; }
-  .reclass-card .progbar { background: #2c2f36 !important; }
-  a { color: #8eb1ff !important; }
-  a:visited { color: #b89aff !important; }
-  table th { background: #1f2228 !important; color: #d8d8dc !important; }
-  table tr:hover { background: #1c1e23 !important; }
-  table td, table th { border-bottom-color: #2c2f36 !important; }
-  input[type=text], input[type=number], select, button,
-  input[type=submit] {
-    background: #1f2228 !important; color: #e6e6e9 !important;
-    border: 1px solid #3a3d45 !important; border-radius: 3px;
-  }
-  input:focus, select:focus { outline: 2px solid #8eb1ff !important; outline-offset: -1px; }
-  code { background: #2a2d34 !important; color: #e6e6e9 !important; }
-  pre  { background: #11131a !important; color: #d8d8dc !important; }
-
-  .verdict      { background: #233055 !important; color: #cbd6ff !important; }
-  .mode         { background: #2a2d34 !important; color: #b0b3bb !important; }
-  .err, .moved-no { color: #ff9d9d !important; }
-  .help, .when, .sender, .reclass-status, .preview { color: #98989f !important; }
-  .conv-tail { color: #6c6c72 !important; }
-  .collapsed-chip { background: #1d2a4d !important; color: #cbd6ff !important;
-                    border-color: #3a4c80 !important; }
-  .pill.right   { background: #1c3a23 !important; color: #88e89c !important; border-color: #2e6a3a !important; }
-  .pill.wrong   { background: #4a1f1f !important; color: #ffb0b0 !important; border-color: #7a3a3a !important; }
-  .reclass      { background: #1d2a4d !important; color: #cbd6ff !important; border: 1px solid #3a4c80 !important; }
-  .add          { background: #1c1f26 !important; border: 1px solid #2c2f36; }
-  .banner       { background: #3a2e0e !important; border-left-color: #c08a16 !important; color: #f0e0a6 !important; }
-  .banner.ok    { background: #14331e !important; border-left-color: #2e8a48 !important; color: #b6e8c2 !important; }
-}
-</style>
-"""
-
-_DECISIONS_HTML = """\
-<!doctype html><title>email-engine-v2 — decisions</title>
-<style>
-  body { font: 14px/1.4 -apple-system, system-ui, sans-serif; margin: 1.5rem; }
-  h1 { font-size: 1.2rem; margin: 0 0 1rem; }
-  table { border-collapse: collapse; width: 100%; }
-  th, td { padding: 6px 8px; border-bottom: 1px solid #eee; vertical-align: top; }
-  th { text-align: left; background: #fafafa; }
-  /* .verdict styles live in _VERDICT_CSS (colored by leading digit). */
-  .mode { font-size: 0.75rem; padding: 1px 5px; border-radius: 3px; background: #f3f3f3; color: #555; margin-left: 4px; }
-  .err { color: #b00; font-size: 0.85rem; }
-  .pill { display: inline-block; padding: 2px 8px; border-radius: 12px; font-size: 0.8rem; cursor: pointer; margin-right: 4px; }
-  .pill.right { background: #d4f8d4; color: #060; border: 1px solid #6c6; }
-  .pill.wrong { background: #fde0e0; color: #800; border: 1px solid #c66; }
-  select { font-size: 0.85rem; padding: 2px 4px; }
-  .subj { font-weight: 600; }
-  .sender { color: #555; font-size: 0.85rem; }
-  .when { color: #777; font-size: 0.8rem; white-space: nowrap; }
-</style>
-""" + _DARK_MODE_CSS + _VERDICT_CSS + _NAV + """\
-<h1>Recent classifications {% if current_mailbox %}— {{ current_mailbox }}{% endif %}</h1>
-
-<form method="get" style="margin-bottom: 1rem;">
-  <label>Mailbox:
-    <select name="mailbox" onchange="this.form.submit()">
-      <option value="">(all)</option>
-      {% for m in mailboxes %}
-        <option value="{{ m }}" {% if m == current_mailbox %}selected{% endif %}>{{ m }}</option>
-      {% endfor %}
-    </select>
-  </label>
-</form>
-
-<table>
-  <thead>
-    <tr><th>When</th><th>Mailbox</th><th>Email</th><th>Verdict</th><th>Feedback</th></tr>
-  </thead>
-  <tbody>
-    {% for d in rows %}
-    <tr>
-      <td class="when">{{ d.created_at[:19].replace('T',' ') }}</td>
-      <td>{{ d.mailbox }}<div style="font-size:0.75rem;color:#888">{{ d.provider }}</div></td>
-      <td>
-        <div class="subj">{{ d.subject or '(no subject)' }}</div>
-        <div class="sender">{{ d.sender or '' }}</div>
-      </td>
-      <td>
-        <span class="verdict {{ d.verdict_folder | verdict_class }}">{{ d.verdict_folder }}</span>
-        <span class="mode">{{ d.apply_mode or '?' }}</span>
-        {% if d.apply_error %}<div class="err">{{ d.apply_error }}</div>{% endif %}
-        {% if not d.moved and d.apply_mode and d.apply_mode != 'tag' %}<div style="font-size:0.8rem;color:#a60">not moved</div>{% endif %}
-      </td>
-      <td>
-        <form method="post" action="/feedback" style="display:inline">
-          <input type="hidden" name="decision_id" value="{{ d.id }}">
-          <input type="hidden" name="correct" value="1">
-          <button class="pill right" type="submit">✓ right</button>
-        </form>
-        <form method="post" action="/feedback" style="display:inline">
-          <input type="hidden" name="decision_id" value="{{ d.id }}">
-          <input type="hidden" name="correct" value="0">
-          <select name="suggested" required>
-            <option value="" disabled selected>move to...</option>
-            {% for f in folders %}
-              <option value="{{ f.id or f.name }}">{{ f.name }}</option>
-            {% endfor %}
-          </select>
-          <button class="pill wrong" type="submit">✗ wrong</button>
-        </form>
-      </td>
-    </tr>
-    {% endfor %}
-  </tbody>
-</table>
-"""
-
-
-_MAILBOXES_HTML = """\
-<!doctype html><title>email-engine-v2 — mailboxes</title>
-<style>
-  body { font: 14px/1.4 -apple-system, system-ui, sans-serif; margin: 1.5rem; max-width: 1100px; }
-  h1, h2 { font-size: 1.1rem; }
-  table { border-collapse: collapse; width: 100%; margin-bottom: 2rem; }
-  th, td { padding: 6px 8px; border-bottom: 1px solid #eee; vertical-align: top; }
-  th { text-align: left; background: #fafafa; }
-  input[type=text], input[type=number], select { padding: 3px 5px; font-size: 0.9rem; }
-  button { padding: 4px 10px; }
-  .add { background: #f8f8fc; padding: 12px; border-radius: 6px; }
-  code { background: #f0f0f4; padding: 1px 4px; border-radius: 3px; }
-  .help { color: #666; font-size: 0.85rem; }
-  .banner { background: #fff8e0; border-left: 3px solid #d8a20a; padding: 8px 12px; margin: 0 0 1rem; font-size: 0.9rem; }
-  .banner.ok { background: #e8f8ee; border-color: #1a9b4a; }
-  .reclass { font-size: 0.8rem; background: #f0f4ff; border: 1px solid #b9c5ec; }
-  .reclass-status { font-size: 0.8rem; color: #555; margin-top: 4px; }
-  .reclass-card { display: none; margin-top: 8px; padding: 8px 12px; border: 1px solid #d6d6dc;
-                  border-radius: 6px; background: #fbfbfd; max-width: 540px; font-size: 0.85rem; }
-  .reclass-card.show { display: block; }
-  .reclass-card table.metrics { border-collapse: collapse; width: 100%; margin: 6px 0 0; }
-  .reclass-card table.metrics th, .reclass-card table.metrics td {
-      padding: 3px 8px; border-bottom: 1px solid #ececf0; text-align: left; vertical-align: top;
-      font-size: 0.85rem;
-  }
-  .reclass-card table.metrics th { font-weight: 600; color: #444; width: 40%; background: transparent; }
-  .reclass-card .dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%;
-                       margin-right: 6px; vertical-align: middle; }
-  .reclass-card .dot.running { background: #1aa8ff; animation: pulse 1.1s ease-in-out infinite; }
-  .reclass-card .dot.done    { background: #2bb24c; }
-  .reclass-card .dot.err     { background: #d84545; }
-  @keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: 0.35; } }
-  .reclass-card .progbar { height: 4px; background: #ececf0; border-radius: 2px;
-                            overflow: hidden; margin-top: 6px; }
-  .reclass-card .progbar > span { display: block; height: 100%; background: #1aa8ff;
-                                  transition: width 250ms ease; }
-  /* Same .preview + .conv-tail rules used on the /threads page; kept here
-     so /changes can adopt them later if needed. */
-</style>
-""" + _DARK_MODE_CSS + _VERDICT_CSS + _NAV + """\
-{% if request.args.get('msg') == 'reclassify-started' %}
-  <div class="banner ok">Reclassify started — walks INBOX + every legacy <code>…-X</code> folder. Watch <a href="/">decisions</a> or poll <code>/api/reclassify/&lt;email&gt;/status</code>.</div>
-{% elif request.args.get('msg') == 'already-running' %}
-  <div class="banner">A reclassify is already in flight for that mailbox — second click ignored.</div>
-{% elif request.args.get('msg') == 'sweep-started' %}
-  <div class="banner ok">Sweep started — moving messages from the requested folder to Inbox in a background thread.</div>
-{% elif request.args.get('msg') == 'sweep-already-running' %}
-  <div class="banner">A sweep is already in flight for that mailbox — second click ignored.</div>
-{% elif request.args.get('msg') == 'paused' %}
-  <div class="banner">Mailbox paused. Polling stops on the next cycle (≤30s). Resume any time.</div>
-{% elif request.args.get('msg') == 'resumed' %}
-  <div class="banner ok">Mailbox resumed. Next poll cycle will pick it back up.</div>
-{% elif request.args.get('msg') == 'paused-all' %}
-  <div class="banner">Paused {{ request.args.get('n', '?') }} mailbox(es). All polling stops next cycle.</div>
-{% elif request.args.get('msg') == 'resumed-all' %}
-  <div class="banner ok">Resumed {{ request.args.get('n', '?') }} mailbox(es).</div>
-{% endif %}
-<h1>Mailboxes</h1>
-
-<div style="margin-bottom: 1rem; display: flex; gap: 8px; align-items: center;">
-  <form method="post" action="/mailboxes/pause-all" style="display:inline"
-        onsubmit="return confirm('Pause ALL mailboxes? Polling stops on every mailbox next cycle. Use this for runaway LLM cost.')">
-    <button type="submit" style="background: #d84545; color: #fff; border: none; padding: 6px 14px; border-radius: 4px; font-weight: 600;">⏸ Pause all</button>
-  </form>
-  <form method="post" action="/mailboxes/resume-all" style="display:inline"
-        onsubmit="return confirm('Resume ALL mailboxes?')">
-    <button type="submit" style="background: #2bb24c; color: #fff; border: none; padding: 6px 14px; border-radius: 4px; font-weight: 600;">▶ Resume all</button>
-  </form>
-  <span class="help" style="margin-left: 8px;">Panic button — pauses every mailbox. Use when LLM cost spikes; each mailbox's config is preserved.</span>
-</div>
-
-<table>
-  <thead><tr>
-    <th>Mailbox</th><th>Provider</th><th>Profile</th><th>Apply mode</th>
-    <th>State</th><th>Model</th><th>API key</th>
-    <th>IMAP server:port</th><th>Poll interval</th><th>Actions</th>
-  </tr></thead>
-  <tbody>
-  {% for m in mailboxes %}
-    <form method="post" action="/mailboxes/{{ m.mailbox }}">
-    <tr>
-      <td>
-        {{ m.mailbox }}
-        <div class="help"><a href="/hierarchies/{{ m.mailbox }}">view taxonomy</a></div>
-      </td>
-      <td>{{ m.provider }}</td>
-      <td>
-        <select name="profile" title="personal: feedback scoped per user. shared: feedback pooled across everyone.">
-          {% for pr in profiles %}
-            <option value="{{ pr }}" {% if pr == m.profile %}selected{% endif %}>{{ pr }}</option>
-          {% endfor %}
-        </select>
-      </td>
-      <td>
-        <select name="apply_mode">
-          {% for am in apply_modes %}
-            <option value="{{ am }}" {% if am == m.apply_mode %}selected{% endif %}>{{ am }}</option>
-          {% endfor %}
-        </select>
-      </td>
-      <td>
-        {# Keep enabled in the form so the Save button doesn't accidentally
-           re-enable a paused mailbox. The one-click pause/resume buttons
-           below are the recommended way to flip state. #}
-        <input type="hidden" name="enabled" value="{% if m.enabled %}1{% else %}0{% endif %}">
-        {% if m.enabled %}
-          <span style="color: #2bb24c; font-weight: 700;" title="polling every cycle">● ACTIVE</span>
-        {% else %}
-          <span style="color: #d84545; font-weight: 700;" title="poller skips this mailbox">● PAUSED</span>
-        {% endif %}
-      </td>
-      <td>
-        <input type="text" name="llm_model" value="{{ m.llm_model or '' }}"
-               placeholder="{{ env_model }}" size="22"
-               title="Per-mailbox model override. Empty = use LLM_MODEL env default ({{ env_model }}). Set to e.g. 'claude-haiku-4-5' to save cost on a less-critical mailbox.">
-      </td>
-      <td>
-        <div class="help" style="font-family: ui-monospace, monospace; margin-bottom: 4px;">
-          {{ m.llm_api_key | api_key_mask }}
-        </div>
-        <input type="password" name="llm_api_key" value=""
-               placeholder="paste new key to replace…" size="20" autocomplete="off"
-               title="Per-mailbox API key. Submitting empty preserves the current value (so you don't have to retype on every Save). Paste a new key to replace; tick the clear box below to remove it.">
-        <label style="font-size: 0.78rem; color: #666; display: block; margin-top: 2px;">
-          <input type="checkbox" name="clear_api_key" value="1"> clear → use env default
-        </label>
-      </td>
-      <td>
-        {% if m.provider == 'imap' %}
-          <input type="text" name="imap_server" value="{{ m.imap_server }}" size="20">
-          :<input type="number" name="imap_port" value="{{ m.imap_port }}" size="5" style="width:60px">
-        {% else %}
-          <span class="help" title="Only used when provider = imap">n/a — Graph mailbox</span>
-          <input type="hidden" name="imap_server" value="{{ m.imap_server }}">
-          <input type="hidden" name="imap_port" value="{{ m.imap_port }}">
-        {% endif %}
-      </td>
-      <td><input type="number" name="poll_interval" value="{{ m.poll_interval }}" style="width:60px"> s</td>
-      <td>
-        <button type="submit">Save</button>
-      </td>
-    </tr>
-    </form>
-    <tr>
-      <td colspan="10" style="border-bottom: 2px solid #f0f0f0; padding-bottom: 12px;">
-        <form method="post" action="/mailboxes/{{ m.mailbox }}/reclassify" style="display:inline-flex; gap:6px; align-items:center; flex-wrap:wrap;"
-              id="reclass-form-{{ m.mailbox }}"
-              onsubmit="return confirm('Reclassify {{ m.mailbox }}? Scope: ' + (document.getElementById('days-{{ m.mailbox }}').value ? 'last ' + document.getElementById('days-{{ m.mailbox }}').value + ' day(s)' : 'ALL history') + '. Walks INBOX plus every legacy …-X folder, newest first.')">
-          <button type="submit" class="reclass">↻ Reclassify</button>
-          <span class="help" style="margin-left:4px">last</span>
-          <input type="number" min="1" max="3650" name="days_back" placeholder="all"
-                 id="days-{{ m.mailbox }}" style="width:72px" title="Blank = walk all history">
-          <span class="help">day(s)</span>
-          <span class="help" style="margin-left:6px">quick:</span>
-          {% for d in [7, 14, 30, 90] %}
-            <button type="button" class="reclass" style="font-size:0.72rem;padding:1px 6px"
-                    onclick="document.getElementById('days-{{ m.mailbox }}').value = {{ d }}">{{ d }}d</button>
-          {% endfor %}
-          <button type="button" class="reclass" style="font-size:0.72rem;padding:1px 6px"
-                  onclick="document.getElementById('days-{{ m.mailbox }}').value = ''">all</button>
-        </form>
-        {% if m.enabled %}
-          <form method="post" action="/mailboxes/{{ m.mailbox }}/pause" style="display:inline; margin-left: 12px;"
-                onsubmit="return confirm('Pause {{ m.mailbox }}? Polling stops on the next cycle. Config is preserved; resume any time.')">
-            <button type="submit" class="reclass" style="background: #fde0e0; border-color: #c66; color: #7a1212;">⏸ Pause</button>
-          </form>
-        {% else %}
-          <form method="post" action="/mailboxes/{{ m.mailbox }}/resume" style="display:inline; margin-left: 12px;">
-            <button type="submit" class="reclass" style="background: #d4f8d4; border-color: #6c6; color: #060;">▶ Resume</button>
-          </form>
-        {% endif %}
-        <form method="post" action="/mailboxes/{{ m.mailbox }}/delete" style="display:inline; margin-left: 12px;"
-              onsubmit="return confirm('Remove this mailbox? Decisions stay, polling stops.')">
-          <button type="submit" style="font-size:0.75rem;color:#a00">delete</button>
-        </form>
-        <span class="help">{{ m.notes }}</span>
-        <div style="margin-top: 8px;">
-          <form method="post" action="/mailboxes/{{ m.mailbox }}/sweep-to-inbox" style="display:inline-flex; gap:6px; align-items:center; flex-wrap:wrap;"
-                onsubmit="return confirm('Move every message in folder \\'' + this.from_folder.value + '\\' to ' + (this.from_folder.value.toLowerCase() === 'inbox' ? 'ERROR' : 'Inbox') + '? Per-message MOVE — runs in the background. Use for cleaning stray folders only.')">
-            <span class="help">Sweep folder → Inbox:</span>
-            <input type="text" name="from_folder" placeholder="e.g. _inbox" style="width:180px" required>
-            <button type="submit" class="reclass" style="font-size:0.75rem;padding:2px 8px">Move all to Inbox</button>
-          </form>
-          <div class="reclass-status" id="sweep-status-{{ m.mailbox }}"></div>
-        </div>
-        <div class="reclass-card" id="card-{{ m.mailbox }}">
-          <div><span class="dot" id="dot-{{ m.mailbox }}"></span><strong id="state-{{ m.mailbox }}">—</strong>
-               <span class="help" style="margin-left:8px" id="scope-{{ m.mailbox }}"></span></div>
-          <div class="progbar" id="progwrap-{{ m.mailbox }}" style="display:none"><span id="prog-{{ m.mailbox }}"></span></div>
-          <table class="metrics">
-            <tr><th>Started</th>          <td id="m-started-{{ m.mailbox }}">—</td></tr>
-            <tr><th>Finished / elapsed</th><td id="m-finished-{{ m.mailbox }}">—</td></tr>
-            <tr><th>Threads classified</th><td id="m-threads-{{ m.mailbox }}">0</td></tr>
-            <tr><th>Errors</th>            <td id="m-errors-{{ m.mailbox }}">0</td></tr>
-            <tr><th>Folders walked</th>    <td id="m-folders-{{ m.mailbox }}">0 / 0</td></tr>
-            <tr><th>Current folder</th>    <td id="m-cur-{{ m.mailbox }}">—</td></tr>
-            <tr><th>Walk cursor</th>       <td id="m-cursor-{{ m.mailbox }}">—</td></tr>
-          </table>
-        </div>
-      </td>
-    </tr>
-  {% endfor %}
-  </tbody>
-</table>
-
-<div class="add">
-<h2>Add a mailbox</h2>
-<form method="post" action="/mailboxes">
-  <label>Email <input type="text" name="mailbox" required size="30" placeholder="dave@9o4t.com"></label>
-  <label>Provider
-    <select name="provider">
-      <option value="graph">graph (Microsoft 365 via token broker)</option>
-      <option value="imap">imap (Gmail / Workspace)</option>
-    </select>
-  </label>
-  <label>Apply mode
-    <select name="apply_mode">
-      {% for am in apply_modes %}<option value="{{ am }}">{{ am }}</option>{% endfor %}
-    </select>
-  </label>
-  <label>Profile
-    <select name="profile" title="personal: feedback scoped per user (your taxonomy reflects YOUR preferences). shared: feedback pooled (workflow mailboxes like quotes@/orders@/helpdesk@).">
-      {% for pr in profiles %}<option value="{{ pr }}">{{ pr }}</option>{% endfor %}
-    </select>
-  </label>
-  <label>Model <input type="text" name="llm_model" placeholder="{{ env_model }}" size="22"
-                     title="Optional per-mailbox model override. Blank = use LLM_MODEL env default ({{ env_model }})."></label>
-  <label>API key <input type="password" name="llm_api_key" placeholder="(blank = LLM_API_KEY env)" size="22" autocomplete="off"
-                       title="Optional per-mailbox API key. Useful for cost attribution per inbox in the provider dashboard."></label>
-  <br><br>
-  <label>IMAP server <input type="text" name="imap_server" size="20" value="imap.gmail.com"></label>
-  <label>Port <input type="number" name="imap_port" value="993" style="width:60px"></label>
-  <label>Poll interval <input type="number" name="poll_interval" value="30" style="width:60px"> s</label>
-  <br><br>
-  <label>Notes <input type="text" name="notes" size="40" placeholder="optional"></label>
-  <br><br>
-  <button type="submit">Add mailbox</button>
-</form>
-
-<p class="help">For <strong>graph</strong>: token broker must be configured (<code>CALENDAR_URL</code> + <code>B2B_TOKEN</code> env vars); IMAP fields ignored.<br>
-For <strong>imap</strong>: set <code>IMAP_&lt;SANITIZED_EMAIL&gt;_PASSWORD</code> in Railway secrets (e.g. <code>IMAP_DAVE_GMAIL_COM_PASSWORD</code>).</p>
-</div>
-
-<script>
-// Live reclassify metrics table. Polls every 2s while a job runs,
-// every 8s otherwise.
-(function () {
-  const mailboxes = {{ mailboxes | map(attribute='mailbox') | list | tojson }};
-
-  function fmtDuration(ms) {
-    if (ms < 1000) return `${ms} ms`;
-    const s = Math.floor(ms / 1000);
-    if (s < 60) return `${s}s`;
-    const m = Math.floor(s / 60), rs = s % 60;
-    return `${m}m ${rs}s`;
-  }
-  function fmtUtc(iso) {
-    if (!iso) return '—';
-    return iso.slice(0, 19).replace('T', ' ') + ' UTC';
-  }
-  function set(id, txt) { const el = document.getElementById(id); if (el) el.textContent = txt; }
-
-  function render(mb, s) {
-    const card = document.getElementById(`card-${mb}`);
-    if (!s || (!s.running && !s.progress && !s.error)) {
-      if (card) card.classList.remove('show');
-      return;
-    }
-    if (card) card.classList.add('show');
-
-    const dot = document.getElementById(`dot-${mb}`);
-    const state = document.getElementById(`state-${mb}`);
-    if (s.running) {
-      dot.className = 'dot running';
-      state.textContent = 'Running…';
-    } else if (s.error) {
-      dot.className = 'dot err';
-      state.textContent = 'Error';
-    } else {
-      dot.className = 'dot done';
-      state.textContent = 'Complete';
-    }
-
-    const scope = s.days_back ? `scope: last ${s.days_back} day(s)` : 'scope: all history';
-    set(`scope-${mb}`, scope);
-    set(`m-started-${mb}`, fmtUtc(s.started_at));
-
-    // Finished / elapsed cell shows finish time when done, live duration when running.
-    if (s.running && s.started_at) {
-      const dur = Date.now() - Date.parse(s.started_at);
-      set(`m-finished-${mb}`, `running — ${fmtDuration(dur)}`);
-    } else if (s.finished_at && s.started_at) {
-      const dur = Date.parse(s.finished_at) - Date.parse(s.started_at);
-      set(`m-finished-${mb}`, `${fmtUtc(s.finished_at)} (${fmtDuration(dur)})`);
-    } else {
-      set(`m-finished-${mb}`, '—');
-    }
-
-    const p = s.progress || {};
-    set(`m-threads-${mb}`, String(p.threads_classified ?? 0));
-    set(`m-errors-${mb}`,  String(p.errors ?? 0));
-    set(`m-folders-${mb}`, `${p.folders_walked ?? 0} / ${p.folders_total ?? 0}`);
-    set(`m-cur-${mb}`,     p.current_folder || (s.running ? 'starting…' : '—'));
-    set(`m-cursor-${mb}`,  p.cursor_received_at ? fmtUtc(p.cursor_received_at) : '—');
-
-    if (s.error) {
-      set(`m-cur-${mb}`, s.error);
-    }
-
-    const progwrap = document.getElementById(`progwrap-${mb}`);
-    const prog = document.getElementById(`prog-${mb}`);
-    if (p.folders_total && p.folders_total > 0 && s.running) {
-      progwrap.style.display = 'block';
-      prog.style.width = `${Math.min(100, (p.folders_walked / p.folders_total) * 100).toFixed(1)}%`;
-    } else {
-      progwrap.style.display = 'none';
-    }
-  }
-
-  function fmtSweep(s) {
-    if (!s) return '';
-    const src = s.from_folder ? `"${s.from_folder}" → Inbox` : '';
-    const p = s.progress || {};
-    if (s.running) return `… sweeping ${src}: moved ${p.moved || 0}, errors ${p.errors || 0}${p.last_error ? ' — ' + p.last_error : ''}`;
-    if (s.error)   return `✗ sweep ${src} error: ${s.error}`;
-    if (p.done)    return `✓ sweep ${src} done: moved ${p.moved || 0}, errors ${p.errors || 0}`;
-    return '';
-  }
-
-  let pollMs = 8000;
-  async function tick() {
-    let anyRunning = false;
-    for (const mb of mailboxes) {
-      try {
-        const r = await fetch(`/api/reclassify/${encodeURIComponent(mb)}/status`);
-        if (r.ok) {
-          const j = await r.json();
-          render(mb, j);
-          if (j && j.running) anyRunning = true;
-        }
-      } catch (_) {}
-      try {
-        const r2 = await fetch(`/api/sweep/${encodeURIComponent(mb)}/status`);
-        if (r2.ok) {
-          const j2 = await r2.json();
-          const el = document.getElementById(`sweep-status-${mb}`);
-          if (el) el.textContent = fmtSweep(j2);
-          if (j2 && j2.running) anyRunning = true;
-        }
-      } catch (_) {}
-    }
-    pollMs = anyRunning ? 2000 : 8000;
-    setTimeout(tick, pollMs);
-  }
-  tick();
-})();
-</script>
-"""
-
-
-_HIERARCHY_HTML = """\
-<!doctype html><title>{{ mailbox }} — taxonomy</title>
-<style>
-  body { font: 14px/1.45 -apple-system, system-ui, sans-serif; margin: 1.5rem; max-width: 900px; }
-  pre {
-    background: #f8f8f8; padding: 12px; border-radius: 6px;
-    white-space: pre-wrap; word-break: break-word; overflow-wrap: anywhere;
-  }
-  .path { color: #666; font-size: 0.85rem; }
-</style>
-""" + _DARK_MODE_CSS + _VERDICT_CSS + _NAV + """\
-<h2>{{ mailbox }} — taxonomy</h2>
-<p class="path">Source: <code>{{ path }}</code></p>
-<p>Edit this file in your fork's <code>src/data/hierarchies/</code> and push to update. Cache invalidates on every feedback submission, so no restart needed once the file lands in the container.</p>
-<pre>{{ data | tojson(indent=2) }}</pre>
-"""
-
-
-_THREADS_HTML = """\
-<!doctype html><title>email-engine-v2 — threads</title>
-<style>
-  body { font: 14px/1.4 -apple-system, system-ui, sans-serif; margin: 1.5rem; }
-  h1 { font-size: 1.2rem; margin: 0 0 1rem; }
-  table { border-collapse: collapse; width: 100%; }
-  th, td { padding: 6px 8px; border-bottom: 1px solid #eee; vertical-align: top; }
-  th { text-align: left; background: #fafafa; }
-  /* .verdict styles live in _VERDICT_CSS (colored by leading digit). */
-  .when { color: #777; font-size: 0.8rem; white-space: nowrap; }
-  .subj { font-weight: 600; }
-  .sender, .help { color: #555; font-size: 0.85rem; }
-  .chip { display: inline-block; font-size: 0.7rem; padding: 1px 5px;
-          border-radius: 8px; background: #fff3d4; color: #6b4d00; margin-left: 4px; }
-  a.tlink { color: inherit; text-decoration: none; }
-  a.tlink:hover { text-decoration: underline; }
-  .preview { color: #666; font-size: 0.8rem; margin-top: 3px;
-             max-width: 700px; line-height: 1.35;
-             display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical;
-             overflow: hidden; }
-  .conv-tail { color: #999; font-family: ui-monospace, monospace; font-size: 0.7rem; }
-  .collapsed-chip { display: inline-block; margin-left: 8px;
-                    font-size: 0.7rem; font-weight: 700; padding: 1px 7px;
-                    border-radius: 999px; background: #ecf3ff; color: #2545a6;
-                    border: 1px solid #b4c7f1; vertical-align: middle; cursor: help; }
-</style>
-""" + _DARK_MODE_CSS + _VERDICT_CSS + _NAV + """\
-<h1>Threads {% if current_mailbox %}— {{ current_mailbox }}{% endif %}</h1>
-
-<form method="get" style="margin-bottom: 1rem;">
-  <label>Mailbox:
-    <select name="mailbox" onchange="this.form.submit()">
-      <option value="">(all)</option>
-      {% for m in mailboxes %}<option value="{{ m }}" {% if m == current_mailbox %}selected{% endif %}>{{ m }}</option>{% endfor %}
-    </select>
-  </label>
-  <label>Group by:
-    <select name="group" onchange="this.form.submit()">
-      <option value="date"    {% if group_by == 'date' %}selected{% endif %}>most-recent activity</option>
-      <option value="verdict" {% if group_by == 'verdict' %}selected{% endif %}>current verdict</option>
-    </select>
-  </label>
-  <label>View:
-    <select name="compact" onchange="this.form.submit()">
-      <option value="0" {% if not compact %}selected{% endif %}>all threads</option>
-      <option value="1" {% if compact %}selected{% endif %}>compact (collapse same subject + sender)</option>
-    </select>
-  </label>
-  <label>Show:
-    <select name="limit" onchange="this.form.submit()">
-      {% for n in [100, 200, 500, 1000] %}<option value="{{ n }}" {% if n == limit %}selected{% endif %}>{{ n }}</option>{% endfor %}
-    </select>
-  </label>
-  <span class="help">
-    {% if compact %}{{ rows|length }} row(s) (collapsed from {{ raw_count }} thread(s)){% else %}{{ rows|length }} thread(s) shown{% endif %}
-  </span>
-</form>
-
-{% if group_counts %}
-<div style="margin: 0 0 1rem; font-size: 0.85rem;">
-  <span class="help">verdict mix:</span>
-  {% for v, n in group_counts.items() | sort %}
-    <span class="verdict {{ v | verdict_class }}" style="margin-right: 4px;">{{ v }} · {{ n }}</span>
-  {% endfor %}
-</div>
-{% endif %}
-
-<table>
-  <thead><tr>
-    <th>Last activity</th><th>Mailbox</th><th>Thread (latest)</th>
-    <th>Current verdict</th><th># msgs</th><th>Verdict history</th>
-  </tr></thead>
-  <tbody>
-    {% set ns = namespace(prev_v=None) %}
-    {% for r in rows %}
-      {% if group_by == 'verdict' and r.latest_verdict != ns.prev_v %}
-        {% set ns.prev_v = r.latest_verdict %}
-        <tr class="grouphdr">
-          <td colspan="6">
-            <span class="verdict {{ r.latest_verdict | verdict_class }}">{{ r.latest_verdict or '(unknown)' }}</span>
-            <span class="group-count">{{ group_counts.get(r.latest_verdict or '(unknown)', 0) }} thread(s)</span>
-          </td>
-        </tr>
-      {% endif %}
-    <tr>
-      <td class="when">{{ r.last_activity[:19].replace('T',' ') if r.last_activity else '' }}</td>
-      <td>{{ r.mailbox }}</td>
-      <td>
-        <div class="subj">
-          <a class="tlink" href="/threads/{{ r.conversation_id }}?mailbox={{ r.mailbox }}">{{ r.subject or '(no subject)' }}</a>
-          {% if r.collapsed_count and r.collapsed_count > 1 %}
-            <span class="collapsed-chip" title="Collapsed {{ r.collapsed_count }} threads with this exact subject + sender. Link opens the most recent.">× {{ r.collapsed_count }}</span>
-          {% endif %}
-        </div>
-        <div class="sender">{{ r.latest_sender or '' }} <span class="conv-tail">· {{ r.conversation_id[-8:] }}</span></div>
-        {% if r.latest_preview %}
-          <div class="preview">{{ r.latest_preview[:140] }}{% if r.latest_preview|length > 140 %}…{% endif %}</div>
-        {% endif %}
-      </td>
-      <td><span class="verdict {{ r.latest_verdict | verdict_class }}">{{ r.latest_verdict }}</span></td>
-      <td>{{ r.msg_count }}</td>
-      <td>
-        {{ r.verdict_count or 0 }} verdict(s)
-        {% if r.verdict_count and r.verdict_count > 1 %}<span class="chip">changed</span>{% endif %}
-      </td>
-    </tr>
-    {% endfor %}
-  </tbody>
-</table>
-"""
-
-
-_THREAD_DETAIL_HTML = """\
-<!doctype html><title>thread {{ conversation_id[:12] }} — email-engine-v2</title>
-<style>
-  body { font: 14px/1.4 -apple-system, system-ui, sans-serif; margin: 1.5rem; max-width: 1100px; }
-  h1, h2 { font-size: 1.1rem; }
-  table { border-collapse: collapse; width: 100%; margin-bottom: 1.5rem; }
-  th, td { padding: 6px 8px; border-bottom: 1px solid #eee; vertical-align: top; }
-  th { text-align: left; background: #fafafa; }
-  /* .verdict styles live in _VERDICT_CSS (colored by leading digit). */
-  .arrow { color: #888; }
-  .when { color: #777; font-size: 0.8rem; white-space: nowrap; }
-  .reason { color: #555; font-style: italic; font-size: 0.85rem;
-            white-space: pre-wrap; word-break: break-word; }
-  .err { color: #b00; font-size: 0.85rem; }
-  code { background: #f0f0f4; padding: 1px 4px; border-radius: 3px; font-size: 0.8rem; }
-  .changed { background: #fff8db; }
-</style>
-""" + _DARK_MODE_CSS + _VERDICT_CSS + _NAV + """\
-<h2>Thread <code>{{ conversation_id[:24] }}…</code></h2>
-<p class="help" style="color: #666; font-size: 0.85rem; margin-top: -8px;">Mailbox: {{ mailbox }}</p>
-
-<h2>Verdict timeline ({{ history|length }} classification(s))</h2>
-<table>
-  <thead><tr><th>When (UTC)</th><th>Verdict</th><th>Trigger subject</th><th>Trigger sender</th><th>Thread size</th><th>Reason</th></tr></thead>
-  <tbody>
-    {% for h in history %}
-    <tr {% if h.prev_verdict and h.prev_verdict != h.verdict_folder %}class="changed"{% endif %}>
-      <td class="when">{{ h.decided_at[:19].replace('T',' ') }}</td>
-      <td>
-        {% if h.prev_verdict and h.prev_verdict != h.verdict_folder %}
-          <span class="verdict {{ h.prev_verdict | verdict_class }}">{{ h.prev_verdict }}</span> <span class="arrow">→</span>
-        {% endif %}
-        <span class="verdict {{ h.verdict_folder | verdict_class }}">{{ h.verdict_folder }}</span>
-      </td>
-      <td>{{ (h.trigger_subject or '')[:80] }}</td>
-      <td>{{ h.trigger_sender or '' }}</td>
-      <td>{{ h.thread_size }}</td>
-      <td class="reason">{{ (h.reason or h.model_raw or '')[:300] }}</td>
-    </tr>
-    {% endfor %}
-  </tbody>
-</table>
-
-<h2>Messages in this thread ({{ decisions|length }})</h2>
-<table>
-  <thead><tr><th>When (UTC)</th><th>Sender</th><th>Subject</th><th>Verdict folder</th><th>Tag</th><th>Move</th><th>Apply error</th></tr></thead>
-  <tbody>
-    {% for d in decisions %}
-    <tr>
-      <td class="when">{{ d.created_at[:19].replace('T',' ') }}</td>
-      <td>{{ d.sender }}</td>
-      <td>{{ (d.subject or '(no subject)')[:80] }}</td>
-      <td><span class="verdict {{ d.verdict_folder | verdict_class }}">{{ d.verdict_folder }}</span></td>
-      <td>{% if d.tagged %}✓{% else %}—{% endif %}</td>
-      <td>{% if d.moved %}✓{% else %}—{% endif %}</td>
-      <td class="err">{{ d.apply_error or '' }}</td>
-    </tr>
-    {% endfor %}
-  </tbody>
-</table>
-"""
-
-
-_CHANGES_HTML = """\
-<!doctype html><title>email-engine-v2 — verdict changes</title>
-<style>
-  body { font: 14px/1.4 -apple-system, system-ui, sans-serif; margin: 1.5rem; }
-  h1 { font-size: 1.2rem; margin: 0 0 1rem; }
-  table { border-collapse: collapse; width: 100%; }
-  th, td { padding: 6px 8px; border-bottom: 1px solid #eee; vertical-align: top; }
-  th { text-align: left; background: #fafafa; }
-  /* .verdict styles live in _VERDICT_CSS (colored by leading digit). */
-  .arrow { color: #888; font-weight: 700; }
-  .when { color: #777; font-size: 0.8rem; white-space: nowrap; }
-  .subj { font-weight: 600; }
-  .sender, .help { color: #555; font-size: 0.85rem; }
-  .reason { color: #555; font-style: italic; font-size: 0.85rem;
-            max-width: 420px; white-space: pre-wrap; word-break: break-word; }
-  a.tlink { color: inherit; text-decoration: none; }
-  a.tlink:hover { text-decoration: underline; }
-</style>
-""" + _DARK_MODE_CSS + _VERDICT_CSS + _NAV + """\
-<h1>Verdict changes {% if current_mailbox %}— {{ current_mailbox }}{% endif %}</h1>
-
-<form method="get" style="margin-bottom: 1rem;">
-  <label>Mailbox:
-    <select name="mailbox" onchange="this.form.submit()">
-      <option value="">(all)</option>
-      {% for m in mailboxes %}<option value="{{ m }}" {% if m == current_mailbox %}selected{% endif %}>{{ m }}</option>{% endfor %}
-    </select>
-  </label>
-  <label>Filter:
-    <select name="changes_only" onchange="this.form.submit()">
-      <option value="1" {% if only_changes %}selected{% endif %}>only verdict changes</option>
-      <option value="0" {% if not only_changes %}selected{% endif %}>every classification (full audit)</option>
-    </select>
-  </label>
-  <label>Show:
-    <select name="limit" onchange="this.form.submit()">
-      {% for n in [100, 200, 500, 1000] %}<option value="{{ n }}" {% if n == limit %}selected{% endif %}>{{ n }}</option>{% endfor %}
-    </select>
-  </label>
-  <span class="help">{{ rows|length }} row(s)</span>
-</form>
-
-<table>
-  <thead><tr>
-    <th>When (UTC)</th><th>Mailbox</th><th>Thread (trigger)</th>
-    <th>Verdict</th><th>Reason</th>
-  </tr></thead>
-  <tbody>
-    {% for r in rows %}
-    <tr>
-      <td class="when">{{ r.decided_at[:19].replace('T',' ') }}</td>
-      <td>{{ r.mailbox }}</td>
-      <td>
-        <div class="subj">
-          <a class="tlink" href="/threads/{{ r.conversation_id }}?mailbox={{ r.mailbox }}">{{ (r.trigger_subject or '(no subject)')[:80] }}</a>
-        </div>
-        <div class="sender">{{ r.trigger_sender or '' }} · thread size: {{ r.thread_size }}</div>
-      </td>
-      <td>
-        {% if r.prev_verdict %}
-          <span class="verdict {{ r.prev_verdict | verdict_class }}">{{ r.prev_verdict }}</span>
-          <span class="arrow">→</span>
-        {% endif %}
-        <span class="verdict {{ r.verdict_folder | verdict_class }}">{{ r.verdict_folder }}</span>
-      </td>
-      <td class="reason">{{ r.reason or r.model_raw or '' }}</td>
-    </tr>
-    {% endfor %}
-  </tbody>
-</table>
-"""
+    return _dashboard_render(
+        _HIERARCHY_HTML,
+        active_tab="mailboxes",
+        page_title="Taxonomy",
+        current_mailbox=email,
+        mailbox=email,
+        path=str(path),
+        data=data,
+    )
 
 
 # --- Test classify (replay a real thread through the classifier) ----------
@@ -1863,8 +1255,10 @@ def test_classify_view():
     burning a 7-day reclassify."""
     min_msgs = int(request.args.get("min", "10"))
     rows = store.list_long_threads(min_messages=min_msgs, limit=100)
-    return render_template_string(
+    return _dashboard_render(
         _TEST_CLASSIFY_HTML,
+        active_tab="test",
+        page_title="Test classify",
         rows=rows,
         min_msgs=min_msgs,
     )
@@ -1983,8 +1377,11 @@ def test_classify_run():
         except Exception as e:
             log.exception("test-classify persist failed: %s", e)
 
-    return render_template_string(
+    return _dashboard_render(
         _TEST_RESULT_HTML,
+        active_tab="test",
+        page_title="Test result",
+        current_mailbox=mb.mailbox,
         mailbox=mb.mailbox,
         thread_key=thread_key,
         conv_id=conv_id,
@@ -2036,13 +1433,14 @@ def feedback_review():
     )
     feedback_users = store.list_feedback_users(mailbox=mailbox)
     proposals = store.list_taxonomy_proposals(mailbox=mailbox, limit=20)
-    return render_template_string(
+    return _dashboard_render(
         _FEEDBACK_REVIEW_HTML,
+        active_tab="feedback",
+        page_title="Feedback",
+        current_mailbox=mailbox or "",
         feedback=feedback,
         feedback_users=feedback_users,
         proposals=proposals,
-        mailboxes=[m.mailbox for m in store.list_mailboxes()],
-        current_mailbox=mailbox or "",
         current_user=current_user,
         mb_profile=mb_profile or "",
     )
@@ -2082,7 +1480,7 @@ def feedback_proposal_view(proposal_id: str):
     p = store.get_taxonomy_proposal(proposal_id)
     if not p:
         abort(404, "proposal not found")
-    return render_template_string(_PROPOSAL_DIFF_HTML, p=p)
+    return _dashboard_render(_PROPOSAL_DIFF_HTML, active_tab="feedback", page_title="Proposal", current_mailbox=p.mailbox, p=p)
 
 
 @app.post("/feedback-review/proposal/<proposal_id>/apply")
@@ -2109,442 +1507,1564 @@ def feedback_proposal_discard(proposal_id: str):
     return Response(status=303, headers={"Location": "/feedback-review"})
 
 
-_FEEDBACK_REVIEW_HTML = """\
-<!doctype html><title>email-engine-v2 — feedback review</title>
-<style>
-  body { font: 14px/1.4 -apple-system, system-ui, sans-serif; margin: 1.5rem; max-width: 1100px; }
-  h1, h2 { font-size: 1.15rem; margin: 0 0 12px; }
-  table { border-collapse: collapse; width: 100%; margin-bottom: 1.5rem; }
-  th, td { padding: 6px 8px; border-bottom: 1px solid #eee; vertical-align: top; font-size: 0.88rem; }
-  th { text-align: left; background: #fafafa; }
-  .when { color: #777; font-size: 0.78rem; white-space: nowrap; }
-  .arrow { color: #888; }
-  .right { color: #196b3a; font-weight: 600; }
-  .wrong { color: #b32626; font-weight: 600; }
-  .note  { color: #444; font-style: italic; max-width: 480px;
-           white-space: pre-wrap; word-break: break-word; }
-  .actions { background: #f0f4ff; border: 1px solid #b9c5ec; padding: 12px;
-             border-radius: 6px; margin-bottom: 1.5rem; }
-  .actions button { padding: 6px 14px; font-size: 0.9rem; }
-  .help { color: #666; font-size: 0.85rem; }
-  .prop-card { border: 1px solid #d6d6dc; border-radius: 6px;
-               padding: 10px 14px; margin: 6px 0; font-size: 0.88rem; }
-  .prop-card.applied   { background: #ecf8ef; border-color: #6dc488; }
-  .prop-card.discarded { background: #fbeaea; border-color: #d68b8b; opacity: 0.7; }
-  a { color: #4a5dd0; }
-</style>
-""" + _DARK_MODE_CSS + _VERDICT_CSS + _NAV + """\
-<h1>Feedback review</h1>
 
-<form method="get" style="margin-bottom: 1rem;">
-  <label>Mailbox:
-    <select name="mailbox" onchange="this.form.submit()">
-      <option value="">(all)</option>
-      {% for m in mailboxes %}<option value="{{ m }}" {% if m == current_mailbox %}selected{% endif %}>{{ m }}</option>{% endfor %}
-    </select>
-  </label>
-  <label>Scope:
-    <select name="user" onchange="this.form.submit()">
-      <option value="__all__" {% if not current_user %}selected{% endif %}>all users (pooled)</option>
-      {% for u in feedback_users %}
-        <option value="{{ u.user_identifier }}" {% if u.user_identifier == current_user %}selected{% endif %}>{{ u.user_identifier }} · {{ u.n }} row(s)</option>
-      {% endfor %}
-    </select>
-  </label>
-  <span class="help">
-    {% if mb_profile == 'shared' %}shared inbox → defaults to pooled
-    {% elif mb_profile == 'personal' %}personal inbox → defaults to your cookie ({{ current_user or '(not set)' }})
-    {% endif %}
-  </span>
-</form>
+# --- Templates --------------------------------------------------------------
+#
+# All authenticated dashboard pages share a sidebar + main shell composed at
+# render-time by `_dashboard_render()`. Each *_HTML below is the *body* that
+# slots into <main class="main"> — no <html>, <head>, or <body> tags. The
+# public feedback-landing pages (`_FEEDBACK_FORM_HTML`, `_FEEDBACK_DONE_HTML`)
+# are standalone — they don't share the dashboard chrome.
 
-{% if current_mailbox %}
-<div class="actions">
-  <form method="post" action="/feedback-review/{{ current_mailbox }}/propose"
-        onsubmit="this.querySelector('button').disabled = true; this.querySelector('button').textContent='Thinking… (~30s)'; return true;"
-        style="display: inline">
-    {% if current_user %}
-      <input type="hidden" name="user_identifier" value="{{ current_user }}">
-      <button type="submit">↻ Generate proposal from <strong>{{ current_user }}</strong>'s {{ feedback|length }} row(s)</button>
+# Design tokens from the cloud handoff (canopy-cool palette). Cool indigo
+# dark theme; single 3px radius; single typeface (Outfit).
+_TOKENS_CSS = """
+:root {
+  --bg:      oklch(0.155 0.014 265);
+  --bg2:     oklch(0.190 0.014 265);
+  --surf:    oklch(0.225 0.014 265);
+  --surf2:   oklch(0.265 0.014 265);
+  --bd:      oklch(0.310 0.014 265);
+  --bd2:     oklch(0.380 0.014 265);
+  --t1:      oklch(0.965 0.005 265);
+  --t2:      oklch(0.780 0.012 265);
+  --t3:      oklch(0.580 0.014 265);
+  --ac:      oklch(0.72 0.17 268);
+  --acFg:    oklch(0.16 0.02 265);
+  --acSoft:  oklch(0.30 0.08 268);
+  --ok:      oklch(0.78 0.13 152);
+  --warn:    oklch(0.80 0.13 78);
+  --err:     oklch(0.74 0.18 24);
+  --v1-bg: oklch(0.55 0.21 25);    --v1-fg: oklch(0.98 0.005 25);
+  --v2-bg: oklch(0.68 0.18 52);    --v2-fg: oklch(0.18 0.05 50);
+  --v3-bg: oklch(0.52 0.18 292);   --v3-fg: oklch(0.98 0.005 290);
+  --v4-bg: oklch(0.82 0.16 92);    --v4-fg: oklch(0.22 0.05 90);
+  --v5-bg: oklch(0.62 0.14 152);   --v5-fg: oklch(0.16 0.04 160);
+  --font-ui: "Outfit", system-ui, sans-serif;
+  --r: 3px;
+}
+"""
+
+_BASE_CSS = """
+*, *::before, *::after { box-sizing: border-box; }
+html, body { margin: 0; padding: 0; height: 100%; background: var(--bg); color: var(--t1);
+             font-family: var(--font-ui); font-size: 13.5px; line-height: 1.5;
+             letter-spacing: -0.005em; -webkit-font-smoothing: antialiased; }
+a { color: var(--ac); text-decoration: none; }
+a:hover { text-decoration: underline; }
+::selection { background: oklch(0.4 0.15 268 / 0.4); }
+
+.app { display: flex; height: 100vh; }
+
+/* Sidebar */
+.sidebar { width: 240px; background: var(--bg); border-right: 1px solid var(--bd);
+           padding: 18px 14px; overflow: auto; flex-shrink: 0;
+           display: flex; flex-direction: column; gap: 18px; }
+.sidebar .brand { display: flex; align-items: center; gap: 10px; padding: 0 6px;
+                  font-size: 15px; font-weight: 600; letter-spacing: -0.02em;
+                  color: var(--t1); text-decoration: none; }
+.sidebar .brand:hover { text-decoration: none; }
+.sidebar .brand .logo { width: 28px; height: 28px; border-radius: 3px;
+                        background: linear-gradient(135deg, oklch(0.78 0.16 268), oklch(0.62 0.18 250));
+                        display: grid; place-items: center; color: oklch(0.98 0.005 265);
+                        font-weight: 700; font-size: 14px;
+                        box-shadow: 0 2px 8px oklch(0.6 0.17 268 / 0.35); }
+.sidebar .brand-name { display: inline-flex; align-items: baseline; gap: 4px; }
+.sidebar .brand-v { color: var(--t3); font-weight: 400; font-size: 12px; }
+
+.sidebar .nav { display: flex; flex-direction: column; gap: 1px; }
+.sidebar .nav-item { display: flex; align-items: center; gap: 10px; padding: 7px 10px;
+                     border-radius: 3px; cursor: pointer; color: var(--t2);
+                     font-size: 13.5px; text-decoration: none; }
+.sidebar .nav-item:hover { background: var(--surf); color: var(--t1); text-decoration: none; }
+.sidebar .nav-item.on { background: var(--surf); color: var(--t1); font-weight: 500; }
+.sidebar .nav-item .ic { width: 16px; height: 16px; flex-shrink: 0; opacity: 0.7; }
+.sidebar .nav-item.on .ic { opacity: 1; color: var(--ac); }
+.sidebar .nav-item .count { margin-left: auto; font-size: 11px; color: var(--t3);
+                            font-variant-numeric: tabular-nums; }
+.sidebar .nav-item.on .count { color: var(--t2); }
+.sidebar .nav-item .pill-count { margin-left: auto; background: var(--acSoft); color: var(--ac);
+                                  padding: 1px 7px; border-radius: 3px; font-size: 10px;
+                                  font-weight: 600; font-variant-numeric: tabular-nums; }
+
+.sidebar .sec h6 { font-size: 11px; color: var(--t3); margin: 0 8px 6px;
+                   text-transform: uppercase; letter-spacing: 0.06em; font-weight: 600; }
+.sidebar .mb { display: flex; align-items: center; gap: 8px; padding: 6px 10px;
+               border-radius: 3px; cursor: pointer; color: var(--t2); font-size: 12.5px;
+               text-decoration: none; }
+.sidebar .mb:hover { background: var(--surf); color: var(--t1); text-decoration: none; }
+.sidebar .mb.on { background: var(--acSoft); color: var(--t1); }
+.sidebar .mb.off { opacity: 0.55; }
+.sidebar .mb .stat { width: 6px; height: 6px; border-radius: 50%; flex-shrink: 0; }
+.sidebar .mb .stat.on { background: var(--ok); box-shadow: 0 0 0 2px oklch(0.78 0.12 152 / 0.15); }
+.sidebar .mb .stat.off { background: var(--t3); }
+.sidebar .mb .mb-email { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.sidebar .mb .count { margin-left: auto; font-size: 11px; color: var(--t3);
+                      font-variant-numeric: tabular-nums; }
+
+.sidebar .sec-utility { display: flex; flex-direction: column; gap: 1px; }
+.sidebar .util-link { display: block; padding: 5px 10px; border-radius: 3px;
+                      font-size: 12px; color: var(--t3); text-decoration: none; }
+.sidebar .util-link:hover { background: var(--surf); color: var(--t1); text-decoration: none; }
+
+.sidebar .footer-side { margin-top: auto; padding: 10px 6px; color: var(--t3); font-size: 11px;
+                        border-top: 1px solid var(--bd); }
+
+/* Main */
+.main { flex: 1; overflow: auto; min-width: 0; padding: 24px 32px 40px; background: var(--bg); }
+
+/* Page header */
+.ph { display: flex; align-items: baseline; gap: 14px; margin-bottom: 22px; flex-wrap: wrap; }
+.ph h1 { font-size: 22px; font-weight: 600; letter-spacing: -0.025em; margin: 0; }
+.ph .sub { color: var(--t3); font-size: 13px; }
+.ph .actions { margin-left: auto; display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+.pill-live { display: inline-flex; align-items: center; gap: 7px; padding: 4px 10px;
+             border-radius: 3px; background: oklch(0.25 0.05 152); color: var(--ok); font-size: 11.5px; }
+.pill-live .pulse { width: 6px; height: 6px; border-radius: 50%; background: var(--ok);
+                    animation: c-pulse 1.7s ease-in-out infinite; }
+@keyframes c-pulse { 0%,100% { opacity: 1; } 50% { opacity: 0.4; } }
+
+/* Buttons */
+.btn { background: var(--bg2); border: 1px solid var(--bd); color: var(--t1);
+       padding: 6px 12px; border-radius: 3px; font-size: 12.5px;
+       font-family: inherit; cursor: pointer; display: inline-flex; align-items: center; gap: 6px;
+       text-decoration: none; }
+.btn:hover { background: var(--surf); border-color: var(--bd2); text-decoration: none; }
+.btn.pri { background: var(--ac); color: var(--acFg); border-color: var(--ac); font-weight: 600; }
+.btn.pri:hover { background: oklch(0.78 0.17 268); }
+.btn.danger { background: oklch(0.3 0.13 22); color: oklch(0.92 0.08 22);
+              border-color: oklch(0.4 0.14 22); }
+.btn.danger:hover { background: oklch(0.35 0.14 22); }
+.btn.sm { padding: 4px 9px; font-size: 11.5px; border-radius: 3px; }
+.btn.ghost { background: transparent; }
+.btn.err-color { color: var(--err); }
+button.btn { font-family: inherit; }
+
+/* Inputs */
+input[type=text], input[type=number], input[type=password], select, textarea {
+  background: var(--bg2); border: 1px solid var(--bd); color: var(--t1);
+  padding: 6px 10px; border-radius: 3px; font-size: 12.5px; font-family: inherit;
+}
+input:focus, select:focus, textarea:focus { outline: none; border-color: var(--ac);
+                                            box-shadow: 0 0 0 3px oklch(0.72 0.17 268 / 0.18); }
+
+/* Verdict pill */
+.vp { display: inline-flex; align-items: center; gap: 6px; padding: 3px 10px;
+      border-radius: 3px; font-size: 11.5px; font-weight: 600;
+      line-height: 1.3; letter-spacing: 0.005em; font-family: inherit;
+      white-space: nowrap; }
+.vp.v1 { background: var(--v1-bg); color: var(--v1-fg); }
+.vp.v2 { background: var(--v2-bg); color: var(--v2-fg); }
+.vp.v3 { background: var(--v3-bg); color: var(--v3-fg); }
+.vp.v4 { background: var(--v4-bg); color: var(--v4-fg); }
+.vp.v5 { background: var(--v5-bg); color: var(--v5-fg); }
+.vp.vu { background: var(--surf2); color: var(--t2); }
+
+/* Stat cards */
+.grid4 { display: grid; grid-template-columns: repeat(4, 1fr); gap: 14px; margin-bottom: 18px; }
+.card { background: var(--bg2); border: 1px solid var(--bd); border-radius: 3px;
+        padding: 16px 18px; }
+.card h6 { font-size: 12px; color: var(--t3); margin: 0 0 10px; font-weight: 500; }
+.card .big { font-size: 28px; font-weight: 600; letter-spacing: -0.028em;
+             font-variant-numeric: tabular-nums; }
+.card .big .suffix { font-size: 14px; color: var(--t3); margin-left: 4px; font-weight: 500; }
+.card .big.err { color: var(--err); }
+.card .delta { font-size: 12px; color: var(--t3); margin-top: 6px;
+               display: inline-flex; align-items: center; gap: 4px; }
+.card .delta.up { color: var(--ok); }
+.card .delta.down { color: var(--err); }
+.card.big-card { padding: 20px 22px; }
+
+/* Sparkline */
+.spark { display: flex; align-items: flex-end; gap: 3px; height: 60px; }
+.spark span { flex: 1; background: linear-gradient(to top, var(--ac), oklch(0.72 0.17 268 / 0.3));
+              border-radius: 3px 3px 0 0; min-height: 2px; }
+.spark-labels { display: flex; justify-content: space-between; color: var(--t3);
+                font-size: 11px; margin-top: 8px; }
+
+/* Verdict mix */
+.vmix { display: flex; height: 14px; border-radius: 3px; overflow: hidden;
+        margin: 10px 0 12px; background: var(--surf); }
+.vmix span { display: block; }
+.vmix-legend { display: grid; grid-template-columns: repeat(5, 1fr); gap: 10px; }
+.vmix-legend > div { display: flex; flex-direction: column; gap: 2px; }
+.vmix-legend .top { display: flex; align-items: center; gap: 6px; color: var(--t2); font-size: 12px; }
+.vmix-legend .num { font-size: 18px; font-weight: 600; letter-spacing: -0.02em;
+                    font-variant-numeric: tabular-nums; }
+.swatch { width: 9px; height: 9px; border-radius: 3px; }
+
+/* Section label */
+.section-label { color: var(--t3); font-size: 11.5px; text-transform: uppercase;
+                 letter-spacing: 0.06em; margin: 0 0 12px; font-weight: 600;
+                 display: flex; align-items: center; gap: 10px; }
+.section-label::after { content: ""; flex: 1; height: 1px; background: var(--bd); }
+
+/* Tables */
+table { width: 100%; border-collapse: collapse; }
+thead th { text-align: left; font-weight: 500; color: var(--t3); font-size: 11.5px;
+           padding: 10px 14px; border-bottom: 1px solid var(--bd);
+           background: oklch(0.21 0.014 265);
+           text-transform: uppercase; letter-spacing: 0.05em; white-space: nowrap; }
+tbody td { padding: 13px 14px; border-bottom: 1px solid var(--bd); vertical-align: top; }
+tbody tr { transition: background 100ms; }
+tbody tr:hover td { background: oklch(0.205 0.014 265); }
+tbody tr:last-child td { border-bottom: none; }
+.when { color: var(--t3); font-size: 12px; white-space: nowrap; font-variant-numeric: tabular-nums; }
+.subj { font-weight: 500; color: var(--t1); font-size: 13.5px; }
+.from { color: var(--t3); font-size: 12px; margin-top: 2px; font-variant-numeric: tabular-nums; }
+.err-line { color: var(--err); font-size: 12px; margin-top: 5px; }
+.applybadge { display: inline-block; padding: 2px 8px; border-radius: 3px;
+              background: var(--surf); color: var(--t2); font-size: 11px; }
+.table-wrap { background: var(--bg2); border: 1px solid var(--bd); border-radius: 3px;
+              overflow: hidden; }
+
+/* Feedback pills */
+.pill-right { background: oklch(0.3 0.1 152); color: oklch(0.88 0.13 152);
+              border: 1px solid oklch(0.42 0.11 152); padding: 4px 10px;
+              border-radius: 3px; font-size: 11.5px; cursor: pointer;
+              font-family: inherit; }
+.pill-wrong { background: oklch(0.30 0.13 22); color: oklch(0.88 0.13 22);
+              border: 1px solid oklch(0.42 0.13 22); padding: 4px 10px;
+              border-radius: 3px; font-size: 11.5px; cursor: pointer;
+              font-family: inherit; }
+.pill-row { display: flex; gap: 4px; flex-wrap: wrap; }
+
+/* Mailbox cards */
+.mb-grid { display: grid; grid-template-columns: 1fr; gap: 14px; }
+.mbcard { background: var(--bg2); border: 1px solid var(--bd); border-radius: 3px;
+          padding: 0; overflow: hidden; transition: border-color 100ms; }
+.mbcard:hover { border-color: var(--bd2); }
+.mbcard.disabled { opacity: 0.75; }
+.mbcard .mhead { display: flex; align-items: center; gap: 12px; padding: 16px 20px;
+                 border-bottom: 1px solid var(--bd); flex-wrap: wrap; }
+.mbcard .avatar { width: 32px; height: 32px; border-radius: 3px;
+                  display: grid; place-items: center; color: oklch(0.98 0.005 265);
+                  font-weight: 600; font-size: 14px;
+                  background: linear-gradient(135deg, oklch(0.72 0.17 268), oklch(0.55 0.17 250));
+                  flex-shrink: 0; }
+.mbcard.disabled .avatar { background: oklch(0.3 0.01 265); color: var(--t3); }
+.mbcard .mhead .meta { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
+.mbcard .mhead .email { font-size: 14.5px; font-weight: 500; letter-spacing: -0.01em; }
+.mbcard .mhead .sub { color: var(--t3); font-size: 12px; }
+.mbcard .mhead .badges { display: inline-flex; gap: 6px; flex-wrap: wrap; margin-left: 4px; }
+.mbcard .badge { font-size: 11px; padding: 2px 8px; border-radius: 3px;
+                 background: var(--surf); color: var(--t2); }
+.mbcard .badge.on { background: oklch(0.28 0.07 152); color: var(--ok); }
+.mbcard .badge.off { background: oklch(0.3 0.05 22); color: oklch(0.85 0.1 22); }
+.mbcard .mhead .actions { margin-left: auto; display: flex; gap: 6px; align-items: center; }
+
+.mbcard .body-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 0;
+                     border-bottom: 1px solid var(--bd); }
+.mbcard .field { padding: 12px 20px; border-right: 1px solid var(--bd);
+                 border-bottom: 1px solid var(--bd); }
+.mbcard .field:nth-child(even) { border-right: none; }
+.mbcard .field:nth-last-child(-n+2) { border-bottom: none; }
+.mbcard .field .k { color: var(--t3); font-size: 11.5px; margin-bottom: 4px;
+                    text-transform: uppercase; letter-spacing: 0.05em; }
+.mbcard .field .v { color: var(--t1); font-size: 13px; display: flex; align-items: center;
+                    gap: 8px; flex-wrap: wrap; min-height: 22px;
+                    font-variant-numeric: tabular-nums; }
+.mbcard .field .v .muted { color: var(--t3); }
+.mbcard .field details summary { cursor: pointer; list-style: none; }
+.mbcard .field details summary::-webkit-details-marker { display: none; }
+.mbcard .field details[open] summary { margin-bottom: 6px; }
+
+/* Segmented control */
+.seg { display: inline-flex; background: var(--bg); border: 1px solid var(--bd);
+       border-radius: 3px; padding: 2px; gap: 0; }
+.seg button { background: transparent; border: none; color: var(--t2);
+              padding: 4px 12px; border-radius: 3px; font-size: 11.5px;
+              cursor: pointer; font-family: inherit; }
+.seg button:hover { color: var(--t1); }
+.seg button.on { background: var(--ac); color: var(--acFg); font-weight: 600; }
+.seg form { display: inline; }
+
+/* Toolbar row on mailbox cards */
+.toolbar-row { display: flex; gap: 8px; padding: 14px 20px; flex-wrap: wrap;
+               background: oklch(0.18 0.014 265); align-items: center; }
+.toolbar-row form { display: inline-flex; gap: 6px; align-items: center; }
+.toolbar-row .spacer { flex: 1; }
+.toolbar-row details summary { cursor: pointer; list-style: none; }
+.toolbar-row details summary::-webkit-details-marker { display: none; }
+.toolbar-row details[open] { width: 100%; }
+.toolbar-row details[open] .details-body { margin-top: 10px; padding: 10px 12px;
+  background: var(--bg2); border: 1px solid var(--bd); border-radius: 3px;
+  display: flex; gap: 6px; flex-wrap: wrap; align-items: center; }
+
+/* Reclassify live card */
+.reclass { padding: 14px 20px; background: oklch(0.22 0.08 268);
+           border-top: 1px solid oklch(0.34 0.10 268); display: none; }
+.reclass.show { display: block; }
+.reclass .top { display: flex; align-items: center; gap: 10px; }
+.reclass .top .lbl { font-weight: 600; color: var(--ac); font-size: 12.5px; }
+.reclass .top .pct { margin-left: auto; font-variant-numeric: tabular-nums;
+                     font-size: 12px; color: var(--t1); font-weight: 600; }
+.reclass .bar { height: 5px; background: oklch(0.2 0.05 268); border-radius: 3px;
+                margin: 10px 0; overflow: hidden; }
+.reclass .bar span { display: block; height: 100%; background: var(--ac);
+                     border-radius: 3px; transition: width 600ms ease; width: 0; }
+.reclass .meta { display: flex; gap: 18px; font-size: 12px; color: var(--t2); flex-wrap: wrap; }
+.reclass .meta b { color: var(--t1); font-weight: 500; }
+.reclass.err { background: oklch(0.22 0.08 22); border-top-color: oklch(0.34 0.10 22); }
+.reclass.err .top .lbl { color: var(--err); }
+.reclass.done .top .lbl { color: var(--ok); }
+
+/* Sweep status line */
+.sweep-status { padding: 10px 20px; font-size: 12px; color: var(--t2);
+                background: oklch(0.18 0.014 265); border-top: 1px solid var(--bd);
+                display: none; }
+.sweep-status.show { display: block; }
+
+/* Feedback split */
+.feed-split { display: grid; grid-template-columns: 1.3fr 1fr; gap: 16px; }
+.proposal { background: var(--bg2); border: 1px solid var(--bd); border-radius: 3px;
+            padding: 16px 18px; margin-bottom: 12px; }
+.proposal.pending { border-left: 3px solid var(--ac);
+                    background: linear-gradient(to right, oklch(0.22 0.06 268), var(--bg2) 35%); }
+.proposal.applied { border-left: 3px solid var(--ok); }
+.proposal.discarded { opacity: 0.6; }
+.proposal h5 { font-size: 13.5px; font-weight: 600; margin: 0; color: var(--t1); }
+.proposal .meta { color: var(--t3); font-size: 12px; margin-top: 4px; }
+.proposal .rat { color: var(--t2); font-size: 13px; margin: 10px 0; line-height: 1.6; }
+.proposal .pa { display: flex; gap: 8px; margin-top: 12px; flex-wrap: wrap; }
+
+/* Misc utilities */
+.banner { padding: 10px 14px; border-radius: 3px; font-size: 13px;
+          margin-bottom: 16px; border: 1px solid var(--bd); background: var(--bg2); }
+.banner.ok { background: oklch(0.25 0.05 152); border-color: oklch(0.35 0.08 152);
+             color: var(--ok); }
+.banner.err { background: oklch(0.25 0.07 22); border-color: oklch(0.35 0.1 22);
+              color: var(--err); }
+.banner.info { background: oklch(0.22 0.06 268); border-color: oklch(0.32 0.08 268);
+               color: var(--t1); }
+code, .mono { font-family: var(--font-ui); font-variant-numeric: tabular-nums; }
+code { background: var(--surf); padding: 1px 5px; border-radius: 3px; font-size: 12px; }
+pre { background: var(--bg); border: 1px solid var(--bd); padding: 12px 14px;
+      border-radius: 3px; overflow: auto; font-size: 12px; line-height: 1.5;
+      font-family: var(--font-ui); white-space: pre-wrap; word-break: break-word; }
+.help { color: var(--t3); font-size: 12px; }
+.note-block { color: var(--t2); font-size: 12.5px; font-style: italic; margin-top: 6px;
+              padding-left: 10px; border-left: 2px solid var(--bd2); }
+.arrow { color: var(--t3); }
+.changed-row td { background: oklch(0.22 0.06 268 / 0.4); }
+hr.divider { border: none; border-top: 1px solid var(--bd); margin: 24px 0; }
+
+/* Inline form rows */
+.row-inline { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; margin-bottom: 12px; }
+.row-inline label { color: var(--t3); font-size: 12px; }
+
+/* Add mailbox panel */
+.add-panel { background: var(--bg2); border: 1px solid var(--bd); border-radius: 3px;
+             padding: 18px 22px; margin-top: 24px; }
+.add-panel h3 { margin: 0 0 14px; font-size: 15px; font-weight: 600; letter-spacing: -0.01em; }
+.add-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(220px, 1fr));
+            gap: 12px 16px; margin-bottom: 14px; }
+.add-grid .add-field label { display: block; color: var(--t3); font-size: 11.5px;
+                              text-transform: uppercase; letter-spacing: 0.05em; margin-bottom: 4px; }
+.add-grid .add-field input, .add-grid .add-field select { width: 100%; }
+
+/* k-v metadata block (test-classify result, etc.) */
+table.kv th { background: oklch(0.21 0.014 265); color: var(--t3);
+              font-weight: 500; text-align: left; width: 180px; padding: 10px 14px;
+              text-transform: uppercase; font-size: 11.5px; letter-spacing: 0.05em; }
+table.kv td { padding: 10px 14px; border-bottom: 1px solid var(--bd); }
+
+/* Banner severity for test classify */
+.banner-big { padding: 14px 18px; font-size: 14px; }
+
+/* Decisions filter row */
+.filter-input { width: 240px; }
+"""
+
+
+# Composed inline-style block injected into every page's <head>. (kept as
+# one string so the `<style>...</style>` tags only appear once.)
+_INLINE_STYLE = "<style>\n" + _TOKENS_CSS + "\n" + _BASE_CSS + "\n</style>"
+
+
+_SHELL_HEAD = """\
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>{{ page_title }} · email-engine v2</title>
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Outfit:wght@400;500;600;700&display=swap" rel="stylesheet">
+""" + _INLINE_STYLE + """
+</head>
+<body>
+<div class="app">
+  <aside class="sidebar">
+    <a class="brand" href="/">
+      <span class="logo">E</span>
+      <span class="brand-name">email-engine<span class="brand-v">v2</span></span>
+    </a>
+    <nav class="nav">
+      <a class="nav-item {% if active_tab=='overview' %}on{% endif %}" href="/">
+        <svg class="ic" viewBox="0 0 20 20" fill="currentColor"><path d="M3 13h2v-3H3v3zm4 0h2V7H7v6zm4 0h2v-9h-2v9zm4 0h2v-5h-2v5z"/></svg>
+        <span>Overview</span>
+      </a>
+      <a class="nav-item {% if active_tab=='decisions' %}on{% endif %}" href="/decisions">
+        <svg class="ic" viewBox="0 0 20 20" fill="currentColor"><path d="M3 5h14v2H3V5zm0 4h14v2H3V9zm0 4h10v2H3v-2z"/></svg>
+        <span>Decisions</span>
+      </a>
+      <a class="nav-item {% if active_tab=='mailboxes' %}on{% endif %}" href="/mailboxes">
+        <svg class="ic" viewBox="0 0 20 20" fill="currentColor"><path d="M3 5h14v10H3V5zm1 1v8h12V6H4zm6 1l5 4h-10l5-4z"/></svg>
+        <span>Mailboxes</span>
+        <span class="count">{{ sidebar.mailboxes|length }}</span>
+      </a>
+      <a class="nav-item {% if active_tab=='feedback' %}on{% endif %}" href="/feedback-review">
+        <svg class="ic" viewBox="0 0 20 20" fill="currentColor"><path d="M4 4h12v9H7l-3 3V4zm2 2v6.2l1.4-1.2H14V6H6z"/></svg>
+        <span>Feedback</span>
+        {% if sidebar.pending_proposals %}<span class="pill-count">{{ sidebar.pending_proposals }}</span>{% endif %}
+      </a>
+      <a class="nav-item {% if active_tab=='threads' %}on{% endif %}" href="/threads">
+        <svg class="ic" viewBox="0 0 20 20" fill="currentColor"><path d="M3 4h14v3H3V4zm0 5h14v3H3V9zm0 5h10v3H3v-3z"/></svg>
+        <span>Threads</span>
+      </a>
+      <a class="nav-item {% if active_tab=='changes' %}on{% endif %}" href="/changes">
+        <svg class="ic" viewBox="0 0 20 20" fill="currentColor"><path d="M5 3l4 4H6v8H4V7H1l4-4zm10 14l-4-4h3V5h2v8h3l-4 4z"/></svg>
+        <span>Changes</span>
+      </a>
+      <a class="nav-item {% if active_tab=='test' %}on{% endif %}" href="/test-classify">
+        <svg class="ic" viewBox="0 0 20 20" fill="currentColor"><path d="M10 2a3 3 0 013 3v4a3 3 0 11-6 0V5a3 3 0 013-3zm-6 13a6 6 0 1112 0v3H4v-3z"/></svg>
+        <span>Test classify</span>
+      </a>
+    </nav>
+    <div class="sec">
+      <h6>Mailboxes</h6>
+      <div class="nav">
+        <a class="mb {% if not sidebar.current %}on{% endif %}" href="/?mailbox=">
+          <span class="stat on"></span>
+          <span class="mb-email">all mailboxes</span>
+          <span class="count">{{ sidebar.total_hr }}/h</span>
+        </a>
+        {% for m in sidebar.mailboxes %}
+        <a class="mb {% if sidebar.current == m.mailbox %}on{% endif %}{% if not m.enabled %} off{% endif %}"
+           href="/?mailbox={{ m.mailbox }}">
+          <span class="stat {% if m.enabled %}on{% else %}off{% endif %}"></span>
+          <span class="mb-email">{{ m.mailbox }}</span>
+          {% if m.enabled %}<span class="count">{{ sidebar.counts.get(m.mailbox, 0) }}/h</span>{% endif %}
+        </a>
+        {% endfor %}
+      </div>
+    </div>
+    <div class="sec sec-utility">
+      <h6>Tools</h6>
+      <a class="util-link" href="/admin/db.sqlite">Download DB</a>
+      <a class="util-link" href="/api/feedback.csv">Feedback CSV</a>
+      <a class="util-link" href="/api/decisions.csv">Decisions CSV</a>
+    </div>
+    <div class="footer-side">email-engine v2 · dark by default</div>
+  </aside>
+  <main class="main">
+"""
+
+_SHELL_FOOT = """\
+  </main>
+</div>
+</body>
+</html>
+"""
+
+
+# --- Overview screen --------------------------------------------------------
+
+_OVERVIEW_HTML = """\
+<div class="ph">
+  <h1>Overview</h1>
+  <span class="sub">{{ mailbox or 'all mailboxes' }} · last 24h</span>
+  <div class="actions">
+    <span class="pill-live"><span class="pulse"></span>polling live</span>
+    <a class="btn" href="/api/decisions.csv{% if mailbox %}?mailbox={{ mailbox }}{% endif %}">Export</a>
+  </div>
+</div>
+
+<div class="grid4">
+  <div class="card">
+    <h6>Classified today</h6>
+    <div class="big">{{ data.classified_today }}</div>
+    {% if data.delta_pct is not none %}
+      <div class="delta {% if data.delta_pct >= 0 %}up{% else %}down{% endif %}">
+        {% if data.delta_pct >= 0 %}↑{% else %}↓{% endif %} {{ '%.0f'|format(data.delta_pct|abs) }}% vs. yesterday
+      </div>
     {% else %}
-      <button type="submit">↻ Generate proposal from ALL users' {{ feedback|length }} row(s) (pooled)</button>
+      <div class="delta">no baseline yet</div>
     {% endif %}
-  </form>
-  {% if current_user %}
-  <form method="post" action="/feedback-review/{{ current_mailbox }}/propose"
-        onsubmit="this.querySelector('button').disabled = true; this.querySelector('button').textContent='Thinking… (~30s)'; return true;"
-        style="display: inline; margin-left: 8px">
-    <button type="submit" style="background: #eee">↻ Also generate pooled (cross-pollination)</button>
-  </form>
-  {% endif %}
-  <div class="help" style="margin-top: 6px">
-    LLM reads the current taxonomy + the feedback rows above and proposes a JSON revision. You review the diff before anything is applied.
+  </div>
+  <div class="card">
+    <h6>Avg latency</h6>
+    <div class="big">
+      {% if data.avg_latency is not none %}{{ '%.1f'|format(data.avg_latency) }}<span class="suffix">s</span>{% else %}—{% endif %}
+    </div>
+    <div class="delta">poll → applied</div>
+  </div>
+  <div class="card">
+    <h6>Apply errors</h6>
+    <div class="big {% if data.apply_errors %}err{% endif %}">{{ data.apply_errors }}</div>
+    <div class="delta {% if data.apply_errors %}down{% endif %}">last 24h</div>
+  </div>
+  <div class="card">
+    <h6>Active mailboxes</h6>
+    <div class="big">{{ data.active_n }}<span class="suffix">/ {{ data.total_n }}</span></div>
+    <div class="delta">{% if data.paused_n %}{{ data.paused_n }} paused{% else %}all active{% endif %}</div>
   </div>
 </div>
-{% else %}
-<div class="help" style="margin-bottom: 1rem;">Pick a mailbox above to enable the "generate proposal" action.</div>
-{% endif %}
 
-<h2>Recent taxonomy proposals ({{ proposals|length }})</h2>
-{% if not proposals %}
-<p class="help">No proposals yet.</p>
-{% endif %}
-{% for p in proposals %}
-<div class="prop-card{% if p.applied_at %} applied{% elif p.discarded_at %} discarded{% endif %}">
-  <div>
-    <a href="/feedback-review/proposal/{{ p.id }}"><strong>{{ p.mailbox }}</strong> · proposal {{ p.id[:8] }}</a>
-    <span class="when">{{ p.created_at[:19].replace('T',' ') }} UTC · based on {{ p.based_on_feedback_count }} feedback row(s)</span>
+<div style="display:grid; grid-template-columns: 1.3fr 1fr; gap: 14px; margin-bottom: 18px;">
+  <div class="card big-card">
+    <h6>Activity · last 24h</h6>
+    <div class="spark">
+      {% for v in data.activity_24h %}
+        <span style="height: {{ ((v / data.activity_24h_max) * 100)|round(0) }}%"></span>
+      {% endfor %}
+    </div>
+    <div class="spark-labels"><span>24h ago</span><span>12h</span><span>now</span></div>
   </div>
-  <div class="help">
-    {% if p.applied_at %}✓ applied {{ p.applied_at[:19].replace('T',' ') }} UTC
-    {% elif p.discarded_at %}✗ discarded {{ p.discarded_at[:19].replace('T',' ') }} UTC
-    {% else %}pending review{% endif %}
+
+  <div class="card big-card">
+    <h6>Verdict mix · last 24h</h6>
+    <div class="vmix">
+      {% set total = data.verdict_total if data.verdict_total > 0 else 1 %}
+      {% for digit, label, color in [('1','P1','var(--v1-bg)'), ('2','P2','var(--v2-bg)'), ('3','P3','var(--v3-bg)'), ('4','P4','var(--v4-bg)'), ('5','P5','var(--v5-bg)')] %}
+        {% set n = data.verdict_counts.get(digit, 0) %}
+        {% if n > 0 %}<span style="width: {{ (n / total * 100) }}%; background: {{ color }};"></span>{% endif %}
+      {% endfor %}
+    </div>
+    <div class="vmix-legend">
+      {% for digit, label, color in [('1','P1','var(--v1-bg)'), ('2','P2','var(--v2-bg)'), ('3','P3','var(--v3-bg)'), ('4','P4','var(--v4-bg)'), ('5','P5','var(--v5-bg)')] %}
+        <div>
+          <div class="top"><span class="swatch" style="background: {{ color }}"></span>{{ label }}</div>
+          <div class="num">{{ data.verdict_counts.get(digit, 0) }}</div>
+        </div>
+      {% endfor %}
+    </div>
   </div>
 </div>
-{% endfor %}
 
-<h2>Feedback rows ({{ feedback|length }})</h2>
-<table>
-  <thead><tr>
-    <th>When</th><th>Mailbox</th><th>User</th><th>Verdict</th><th>Subject</th>
-    <th>Right/Wrong</th><th>Note</th>
-  </tr></thead>
-  <tbody>
-  {% for f in feedback %}
-    <tr>
-      <td class="when">{{ f.created_at[:19].replace('T',' ') }}</td>
-      <td>{{ f.mailbox }}</td>
-      <td>{{ f.user_identifier or '(anonymous)' }}</td>
-      <td>
-        <span class="verdict {{ f.model_choice | verdict_class }}">{{ f.model_choice }}</span>
-        {% if f.suggested and f.suggested != f.model_choice %}
-          <span class="arrow">→</span>
-          <span class="verdict {{ f.suggested | verdict_class }}">{{ f.suggested }}</span>
+<div class="section-label">Recent decisions</div>
+<div class="table-wrap">
+  <table>
+    <tbody>
+      {% for d in data.recent %}
+      <tr>
+        <td class="when" style="width: 90px">{{ d.created_at[11:19] }}</td>
+        <td>
+          <div class="subj">{{ (d.subject or '(no subject)')[:80] }}</div>
+          <div class="from">{{ d.sender or '' }} · {{ d.mailbox }}</div>
+        </td>
+        <td style="width: 160px; text-align: right">
+          <span class="vp {{ d.verdict_folder | verdict_class }}">{{ d.verdict_folder }}</span>
+        </td>
+      </tr>
+      {% else %}
+      <tr><td style="text-align: center; padding: 32px; color: var(--t3);">No classifications yet.</td></tr>
+      {% endfor %}
+    </tbody>
+  </table>
+</div>
+
+<div style="margin-top: 14px;">
+  <a class="btn" href="/decisions{% if mailbox %}?mailbox={{ mailbox }}{% endif %}">View all decisions →</a>
+</div>
+"""
+
+
+# --- Decisions screen -------------------------------------------------------
+
+_DECISIONS_HTML = """\
+<div class="ph">
+  <h1>Decisions</h1>
+  <span class="sub">{{ rows|length }} most recent{% if current_mailbox %} · {{ current_mailbox }}{% endif %}</span>
+  <div class="actions">
+    <form method="get" style="display:inline-flex; gap: 8px; align-items: center;">
+      <input type="text" name="q" placeholder="Filter…" class="filter-input"
+             oninput="filterRows(this.value)">
+      <select name="mailbox" onchange="this.form.submit()">
+        <option value="">All mailboxes</option>
+        {% for m in sidebar.mailboxes %}
+          <option value="{{ m.mailbox }}" {% if m.mailbox == current_mailbox %}selected{% endif %}>{{ m.mailbox }}</option>
+        {% endfor %}
+      </select>
+    </form>
+    <a class="btn" href="/api/decisions.csv{% if current_mailbox %}?mailbox={{ current_mailbox }}{% endif %}">Export</a>
+  </div>
+</div>
+
+<div class="table-wrap">
+  <table id="decisions-table">
+    <thead>
+      <tr>
+        <th style="width: 90px">When</th>
+        <th>Email</th>
+        <th style="width: 160px">Verdict</th>
+        <th style="width: 140px">Apply</th>
+        <th style="width: 280px">Feedback</th>
+      </tr>
+    </thead>
+    <tbody>
+      {% for d in rows %}
+      <tr data-search="{{ ((d.subject or '') ~ ' ' ~ (d.sender or '') ~ ' ' ~ d.mailbox ~ ' ' ~ (d.verdict_folder or ''))|lower }}">
+        <td class="when">{{ d.created_at[:19].replace('T',' ') }}</td>
+        <td>
+          <div class="subj">{{ d.subject or '(no subject)' }}</div>
+          <div class="from">{{ d.sender or '' }} · {{ d.mailbox }}</div>
+          {% if d.apply_error %}<div class="err-line">↻ {{ d.apply_error[:120] }}</div>{% endif %}
+        </td>
+        <td><span class="vp {{ d.verdict_folder | verdict_class }}">{{ d.verdict_folder }}</span></td>
+        <td>
+          <span class="applybadge">{{ d.apply_mode or '?' }}</span>
+          <div class="from" style="margin-top: 4px;">
+            {% if d.tagged %}✓ tagged{% endif %}{% if d.tagged and d.moved %} · {% endif %}{% if d.moved %}✓ moved{% endif %}
+            {% if not d.tagged and not d.moved %}—{% endif %}
+          </div>
+        </td>
+        <td>
+          <div class="pill-row">
+            <form method="post" action="/feedback" style="display: inline">
+              <input type="hidden" name="decision_id" value="{{ d.id }}">
+              <input type="hidden" name="correct" value="1">
+              <button class="pill-right" type="submit">✓ right</button>
+            </form>
+            <form method="post" action="/feedback" style="display: inline-flex; gap: 4px; align-items: center;">
+              <input type="hidden" name="decision_id" value="{{ d.id }}">
+              <input type="hidden" name="correct" value="0">
+              <select name="suggested" required style="font-size: 11.5px; padding: 3px 6px;">
+                <option value="" disabled selected>move to…</option>
+                {% for f in folders %}
+                  <option value="{{ f.id or f.name }}">{{ f.name }}</option>
+                {% endfor %}
+              </select>
+              <button class="pill-wrong" type="submit">✗ wrong</button>
+            </form>
+          </div>
+        </td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+</div>
+
+<script>
+function filterRows(q) {
+  q = (q || '').toLowerCase().trim();
+  var rows = document.querySelectorAll('#decisions-table tbody tr');
+  rows.forEach(function(r){
+    var s = r.getAttribute('data-search') || '';
+    r.style.display = (!q || s.indexOf(q) !== -1) ? '' : 'none';
+  });
+}
+</script>
+"""
+
+
+# --- Mailboxes screen -------------------------------------------------------
+
+_MAILBOXES_HTML = """\
+<div class="ph">
+  <h1>Mailboxes</h1>
+  {% set active_n = mailboxes|selectattr('enabled')|list|length %}
+  {% set paused_n = mailboxes|rejectattr('enabled')|list|length %}
+  <span class="sub">{{ active_n }} active · {{ paused_n }} paused</span>
+  <div class="actions">
+    <form method="post" action="/mailboxes/pause-all" style="display:inline"
+          onsubmit="return confirm('Pause ALL mailboxes? Polling stops everywhere next cycle. Use for runaway LLM cost.')">
+      <button type="submit" class="btn danger" title="Panic button">⏸ Pause all</button>
+    </form>
+    <form method="post" action="/mailboxes/resume-all" style="display:inline"
+          onsubmit="return confirm('Resume ALL mailboxes?')">
+      <button type="submit" class="btn">▶ Resume all</button>
+    </form>
+    <a class="btn pri" href="#add-mailbox">+ Add mailbox</a>
+  </div>
+</div>
+
+{% if request.args.get('msg') == 'reclassify-started' %}
+  <div class="banner ok">Reclassify started — walks INBOX plus every legacy …-X folder. Watch the live card below or the <a href="/decisions">decisions</a> list.</div>
+{% elif request.args.get('msg') == 'already-running' %}
+  <div class="banner">A reclassify is already in flight for that mailbox — second click ignored.</div>
+{% elif request.args.get('msg') == 'sweep-started' %}
+  <div class="banner ok">Sweep started — moving messages to Inbox in a background thread.</div>
+{% elif request.args.get('msg') == 'sweep-already-running' %}
+  <div class="banner">A sweep is already in flight — second click ignored.</div>
+{% elif request.args.get('msg') == 'paused' %}
+  <div class="banner">Mailbox paused. Polling stops on the next cycle (≤30s).</div>
+{% elif request.args.get('msg') == 'resumed' %}
+  <div class="banner ok">Mailbox resumed.</div>
+{% elif request.args.get('msg') == 'paused-all' %}
+  <div class="banner">Paused {{ request.args.get('n', '?') }} mailbox(es). All polling stops next cycle.</div>
+{% elif request.args.get('msg') == 'resumed-all' %}
+  <div class="banner ok">Resumed {{ request.args.get('n', '?') }} mailbox(es).</div>
+{% endif %}
+
+{% set active_mbs = mailboxes|selectattr('enabled')|list %}
+{% set paused_mbs = mailboxes|rejectattr('enabled')|list %}
+
+{% macro mbcard(m) %}
+  <div class="mbcard {% if not m.enabled %}disabled{% endif %}" id="mb-{{ m.mailbox }}">
+    <div class="mhead">
+      <div class="avatar">{{ m.mailbox[0]|upper }}</div>
+      <div class="meta">
+        <span class="email">{{ m.mailbox }}</span>
+        <div class="sub">
+          {% if m.notes %}{{ m.notes }}
+          {% elif m.provider == 'graph' %}Microsoft Graph mailbox
+          {% else %}IMAP mailbox{% endif %}
+        </div>
+      </div>
+      <div class="badges">
+        <span class="badge">{{ m.provider }}</span>
+        <span class="badge">{{ m.profile }}</span>
+        <span class="badge {% if m.enabled %}on{% else %}off{% endif %}">● {% if m.enabled %}active{% else %}paused{% endif %}</span>
+      </div>
+      <div class="actions">
+        {% if m.enabled %}
+        <form method="post" action="/mailboxes/{{ m.mailbox }}/pause" style="display:inline"
+              onsubmit="return confirm('Pause {{ m.mailbox }}? Polling stops next cycle; config preserved.')">
+          <button type="submit" class="btn sm">⏸ Pause</button>
+        </form>
+        {% else %}
+        <form method="post" action="/mailboxes/{{ m.mailbox }}/resume" style="display:inline">
+          <button type="submit" class="btn sm pri">▶ Resume</button>
+        </form>
         {% endif %}
-      </td>
-      <td>{{ (f.subject or '(no subject)')[:60] }}</td>
-      <td>{% if f.correct %}<span class="right">✓ correct</span>{% else %}<span class="wrong">✗ wrong</span>{% endif %}</td>
-      <td class="note">{{ f.note or '' }}</td>
-    </tr>
+        <a class="btn sm ghost" href="/hierarchies/{{ m.mailbox }}" title="View taxonomy">⋯</a>
+      </div>
+    </div>
+
+    <div class="body-grid">
+      <div class="field">
+        <div class="k">Apply mode</div>
+        <div class="v">
+          <form method="post" action="/mailboxes/{{ m.mailbox }}" class="seg">
+            <button name="apply_mode" value="tag" class="{% if m.apply_mode=='tag' %}on{% endif %}">tag</button>
+            <button name="apply_mode" value="move" class="{% if m.apply_mode=='move' %}on{% endif %}">move</button>
+            <button name="apply_mode" value="tag_and_move" class="{% if m.apply_mode=='tag_and_move' %}on{% endif %}">both</button>
+          </form>
+        </div>
+      </div>
+      <div class="field">
+        <div class="k">Profile</div>
+        <div class="v">
+          <form method="post" action="/mailboxes/{{ m.mailbox }}" class="seg">
+            <button name="profile" value="personal" class="{% if m.profile=='personal' %}on{% endif %}">personal</button>
+            <button name="profile" value="shared" class="{% if m.profile=='shared' %}on{% endif %}">shared</button>
+          </form>
+        </div>
+      </div>
+      <div class="field">
+        <div class="k">Model</div>
+        <div class="v">
+          <details>
+            <summary>
+              {% if m.llm_model %}{{ m.llm_model }}{% else %}<span class="muted">env default ({{ env_model }})</span>{% endif %}
+              <span style="margin-left: 8px; color: var(--t3); font-size: 11.5px;">edit ▸</span>
+            </summary>
+            <form method="post" action="/mailboxes/{{ m.mailbox }}" style="display:flex; gap: 6px; margin-top: 6px;">
+              <input type="text" name="llm_model" value="{{ m.llm_model or '' }}" placeholder="{{ env_model }}" style="flex:1; min-width: 0;">
+              <button type="submit" class="btn sm pri">Save</button>
+            </form>
+          </details>
+        </div>
+      </div>
+      <div class="field">
+        <div class="k">API key</div>
+        <div class="v">
+          <details>
+            <summary>
+              {% if m.llm_api_key %}<span style="color: var(--ok)">● set</span>
+              <span class="muted">{{ m.llm_api_key | api_key_mask }}</span>
+              {% else %}<span class="muted">uses env $LLM_API_KEY</span>{% endif %}
+              <span style="margin-left: 8px; color: var(--t3); font-size: 11.5px;">replace ▸</span>
+            </summary>
+            <form method="post" action="/mailboxes/{{ m.mailbox }}" style="display:flex; flex-direction: column; gap: 6px; margin-top: 6px;">
+              <input type="password" name="llm_api_key" placeholder="paste new key…" autocomplete="off">
+              <label class="help" style="display:inline-flex; gap: 4px; align-items: center; font-size: 11.5px;">
+                <input type="checkbox" name="clear_api_key" value="1"> clear → use env default
+              </label>
+              <button type="submit" class="btn sm pri" style="align-self: flex-start;">Save</button>
+            </form>
+          </details>
+        </div>
+      </div>
+      {% if m.provider == 'imap' %}
+      <div class="field">
+        <div class="k">IMAP server</div>
+        <div class="v">{{ m.imap_server }}:{{ m.imap_port }}</div>
+      </div>
+      {% else %}
+      <div class="field">
+        <div class="k">Connection</div>
+        <div class="v"><span class="muted">Token broker (n8n) → Graph v1.0</span></div>
+      </div>
+      {% endif %}
+      <div class="field">
+        <div class="k">Poll interval</div>
+        <div class="v">
+          <details>
+            <summary>{{ m.poll_interval }}s <span style="margin-left: 8px; color: var(--t3); font-size: 11.5px;">edit ▸</span></summary>
+            <form method="post" action="/mailboxes/{{ m.mailbox }}" style="display:flex; gap: 6px; margin-top: 6px;">
+              <input type="number" name="poll_interval" value="{{ m.poll_interval }}" min="5" max="3600" style="width: 100px;">
+              <button type="submit" class="btn sm pri">Save</button>
+            </form>
+          </details>
+        </div>
+      </div>
+    </div>
+
+    <div class="toolbar-row">
+      <details>
+        <summary><button type="button" class="btn sm">↻ Reclassify…</button></summary>
+        <div class="details-body">
+          <form method="post" action="/mailboxes/{{ m.mailbox }}/reclassify"
+                onsubmit="return confirm('Reclassify {{ m.mailbox }}? ' + (this.days_back.value ? 'Last ' + this.days_back.value + ' day(s)' : 'ALL history') + '.')">
+            <span class="help">last</span>
+            <input type="number" name="days_back" min="1" max="3650" placeholder="all" style="width: 80px;">
+            <span class="help">day(s)</span>
+            {% for d in [7, 14, 30, 90] %}
+              <button type="button" class="btn sm" onclick="this.form.days_back.value={{ d }}">{{ d }}d</button>
+            {% endfor %}
+            <button type="button" class="btn sm" onclick="this.form.days_back.value=''">all</button>
+            <button type="submit" class="btn sm pri">↻ Go</button>
+          </form>
+        </div>
+      </details>
+      <a class="btn sm" href="/hierarchies/{{ m.mailbox }}">View taxonomy</a>
+      <details>
+        <summary><button type="button" class="btn sm">Sweep folder → Inbox</button></summary>
+        <div class="details-body">
+          <form method="post" action="/mailboxes/{{ m.mailbox }}/sweep-to-inbox"
+                onsubmit="return confirm('Move every message in &quot;' + this.from_folder.value + '&quot; to Inbox?')">
+            <span class="help">from</span>
+            <input type="text" name="from_folder" placeholder="e.g. _inbox" required style="width: 200px;">
+            <button type="submit" class="btn sm pri">Sweep</button>
+          </form>
+        </div>
+      </details>
+      <a class="btn sm" href="/decisions?mailbox={{ m.mailbox }}">Recent decisions</a>
+      <div class="spacer"></div>
+      <form method="post" action="/mailboxes/{{ m.mailbox }}/delete" style="display:inline"
+            onsubmit="return confirm('Remove this mailbox? Decisions stay, polling stops.')">
+        <button type="submit" class="btn sm ghost err-color">Remove mailbox</button>
+      </form>
+    </div>
+
+    <div class="sweep-status" id="sweep-status-{{ m.mailbox }}"></div>
+
+    <div class="reclass" id="reclass-{{ m.mailbox }}">
+      <div class="top">
+        <span class="lbl" id="reclass-lbl-{{ m.mailbox }}">↻ Reclassifying…</span>
+        <span class="pct" id="reclass-pct-{{ m.mailbox }}">0%</span>
+      </div>
+      <div class="bar"><span id="reclass-bar-{{ m.mailbox }}"></span></div>
+      <div class="meta">
+        <span><b id="reclass-threads-{{ m.mailbox }}">0</b> threads classified</span>
+        <span>folder <b id="reclass-folders-{{ m.mailbox }}">0/0</b></span>
+        <span id="reclass-curfolder-{{ m.mailbox }}">starting…</span>
+      </div>
+    </div>
+  </div>
+{% endmacro %}
+
+{% if active_mbs %}
+<div class="section-label">Active</div>
+<div class="mb-grid">
+  {% for m in active_mbs %}{{ mbcard(m) }}{% endfor %}
+</div>
+{% endif %}
+
+{% if paused_mbs %}
+<div class="section-label" style="margin-top: 28px;">Paused</div>
+<div class="mb-grid">
+  {% for m in paused_mbs %}{{ mbcard(m) }}{% endfor %}
+</div>
+{% endif %}
+
+<div class="add-panel" id="add-mailbox">
+  <h3>Add a mailbox</h3>
+  <form method="post" action="/mailboxes">
+    <div class="add-grid">
+      <div class="add-field"><label>Email</label><input type="text" name="mailbox" required placeholder="dave@9o4t.com"></div>
+      <div class="add-field"><label>Provider</label>
+        <select name="provider">
+          <option value="graph">graph (Microsoft 365)</option>
+          <option value="imap">imap (Gmail / Workspace)</option>
+        </select>
+      </div>
+      <div class="add-field"><label>Apply mode</label>
+        <select name="apply_mode">
+          {% for am in apply_modes %}<option value="{{ am }}">{{ am }}</option>{% endfor %}
+        </select>
+      </div>
+      <div class="add-field"><label>Profile</label>
+        <select name="profile">
+          {% for pr in profiles %}<option value="{{ pr }}">{{ pr }}</option>{% endfor %}
+        </select>
+      </div>
+      <div class="add-field"><label>Model (optional)</label>
+        <input type="text" name="llm_model" placeholder="{{ env_model }}"></div>
+      <div class="add-field"><label>API key (optional)</label>
+        <input type="password" name="llm_api_key" placeholder="(blank = env default)" autocomplete="off"></div>
+      <div class="add-field"><label>IMAP server</label>
+        <input type="text" name="imap_server" value="imap.gmail.com"></div>
+      <div class="add-field"><label>IMAP port</label>
+        <input type="number" name="imap_port" value="993"></div>
+      <div class="add-field"><label>Poll interval (s)</label>
+        <input type="number" name="poll_interval" value="30"></div>
+      <div class="add-field" style="grid-column: span 2;"><label>Notes</label>
+        <input type="text" name="notes" placeholder="optional"></div>
+    </div>
+    <button type="submit" class="btn pri">Add mailbox</button>
+    <span class="help" style="margin-left: 12px;">
+      For graph: token broker required (CALENDAR_URL + B2B_TOKEN env). For imap: set IMAP_&lt;SANITIZED&gt;_PASSWORD secret.
+    </span>
+  </form>
+</div>
+
+<script>
+(function () {
+  var mailboxes = {{ mailboxes | map(attribute='mailbox') | list | tojson }};
+
+  function set(id, txt) { var el = document.getElementById(id); if (el) el.textContent = txt; }
+
+  function renderReclass(mb, s) {
+    var card = document.getElementById('reclass-' + mb);
+    if (!card) return;
+    if (!s || (!s.running && !s.progress && !s.error && !s.finished_at)) {
+      card.classList.remove('show', 'err', 'done');
+      return;
+    }
+    card.classList.add('show');
+    card.classList.remove('err', 'done');
+    var lbl = document.getElementById('reclass-lbl-' + mb);
+    var p = s.progress || {};
+    var pct = (p.folders_total && p.folders_total > 0)
+              ? Math.min(100, (p.folders_walked / p.folders_total) * 100) : 0;
+    if (s.running) {
+      lbl.textContent = '↻ Reclassifying' + (s.days_back ? ' — last ' + s.days_back + ' days' : ' — all history');
+    } else if (s.error) {
+      card.classList.add('err');
+      lbl.textContent = '✗ Reclassify failed: ' + (s.error || '').slice(0, 80);
+    } else {
+      card.classList.add('done');
+      lbl.textContent = '✓ Reclassify complete';
+      pct = 100;
+    }
+    set('reclass-pct-' + mb, Math.round(pct) + '%');
+    var bar = document.getElementById('reclass-bar-' + mb);
+    if (bar) bar.style.width = pct + '%';
+    set('reclass-threads-' + mb, String(p.threads_classified || 0));
+    set('reclass-folders-' + mb, (p.folders_walked || 0) + '/' + (p.folders_total || 0));
+    set('reclass-curfolder-' + mb, p.current_folder || (s.running ? 'starting…' : ''));
+  }
+
+  function fmtSweep(s) {
+    if (!s) return '';
+    var src = s.from_folder ? '"' + s.from_folder + '" → Inbox' : '';
+    var p = s.progress || {};
+    if (s.running) return '… sweeping ' + src + ': moved ' + (p.moved || 0) + ', errors ' + (p.errors || 0);
+    if (s.error)   return '✗ sweep ' + src + ' error: ' + s.error;
+    if (p.done)    return '✓ sweep ' + src + ' done: moved ' + (p.moved || 0) + ', errors ' + (p.errors || 0);
+    return '';
+  }
+
+  function renderSweep(mb, s) {
+    var el = document.getElementById('sweep-status-' + mb);
+    if (!el) return;
+    var txt = fmtSweep(s);
+    if (txt) { el.textContent = txt; el.classList.add('show'); }
+    else     { el.textContent = ''; el.classList.remove('show'); }
+  }
+
+  var pollMs = 8000;
+  function tick() {
+    var anyRunning = false;
+    var pending = mailboxes.length * 2;
+    if (!pending) { setTimeout(tick, pollMs); return; }
+    mailboxes.forEach(function(mb) {
+      fetch('/api/reclassify/' + encodeURIComponent(mb) + '/status')
+        .then(function(r){ return r.ok ? r.json() : null; })
+        .then(function(j){ renderReclass(mb, j); if (j && j.running) anyRunning = true; })
+        .catch(function(){})
+        .finally(function(){ if (--pending === 0) { pollMs = anyRunning ? 2000 : 8000; setTimeout(tick, pollMs); } });
+      fetch('/api/sweep/' + encodeURIComponent(mb) + '/status')
+        .then(function(r){ return r.ok ? r.json() : null; })
+        .then(function(j){ renderSweep(mb, j); if (j && j.running) anyRunning = true; })
+        .catch(function(){})
+        .finally(function(){ if (--pending === 0) { pollMs = anyRunning ? 2000 : 8000; setTimeout(tick, pollMs); } });
+    });
+  }
+  tick();
+})();
+</script>
+"""
+
+
+# --- Threads screen ---------------------------------------------------------
+
+_THREADS_HTML = """\
+<div class="ph">
+  <h1>Threads</h1>
+  <span class="sub">
+    {% if compact %}{{ rows|length }} row(s) (collapsed from {{ raw_count }} thread(s))
+    {% else %}{{ rows|length }} thread(s){% endif %}
+    {% if current_mailbox %} · {{ current_mailbox }}{% endif %}
+  </span>
+  <div class="actions">
+    <form method="get" style="display:inline-flex; gap: 8px; align-items: center;">
+      <select name="mailbox" onchange="this.form.submit()">
+        <option value="">All mailboxes</option>
+        {% for m in sidebar.mailboxes %}<option value="{{ m.mailbox }}" {% if m.mailbox == current_mailbox %}selected{% endif %}>{{ m.mailbox }}</option>{% endfor %}
+      </select>
+      <select name="group" onchange="this.form.submit()">
+        <option value="date"    {% if group_by == 'date' %}selected{% endif %}>by recent activity</option>
+        <option value="verdict" {% if group_by == 'verdict' %}selected{% endif %}>by current verdict</option>
+      </select>
+      <select name="compact" onchange="this.form.submit()">
+        <option value="0" {% if not compact %}selected{% endif %}>all threads</option>
+        <option value="1" {% if compact %}selected{% endif %}>compact</option>
+      </select>
+      <select name="limit" onchange="this.form.submit()">
+        {% for n in [100, 200, 500, 1000] %}<option value="{{ n }}" {% if n == limit %}selected{% endif %}>{{ n }}</option>{% endfor %}
+      </select>
+    </form>
+  </div>
+</div>
+
+{% if group_counts %}
+<div class="row-inline" style="margin-bottom: 16px;">
+  <span class="help">verdict mix:</span>
+  {% for v, n in group_counts.items() | sort %}
+    <span class="vp {{ v | verdict_class }}">{{ v }} · {{ n }}</span>
   {% endfor %}
-  </tbody>
-</table>
+</div>
+{% endif %}
+
+<div class="table-wrap">
+  <table>
+    <thead><tr>
+      <th>Last activity</th><th>Thread (latest)</th>
+      <th>Verdict</th><th># msgs</th><th>History</th>
+    </tr></thead>
+    <tbody>
+      {% set ns = namespace(prev_v=None) %}
+      {% for r in rows %}
+        {% if group_by == 'verdict' and r.latest_verdict != ns.prev_v %}
+          {% set ns.prev_v = r.latest_verdict %}
+          <tr>
+            <td colspan="5" style="background: oklch(0.21 0.014 265); padding: 14px;">
+              <span class="vp {{ r.latest_verdict | verdict_class }}">{{ r.latest_verdict or '(unknown)' }}</span>
+              <span class="help" style="margin-left: 10px;">{{ group_counts.get(r.latest_verdict or '(unknown)', 0) }} thread(s)</span>
+            </td>
+          </tr>
+        {% endif %}
+      <tr>
+        <td class="when">{{ r.last_activity[:19].replace('T',' ') if r.last_activity else '' }}</td>
+        <td>
+          <div class="subj">
+            <a href="/threads/{{ r.conversation_id }}?mailbox={{ r.mailbox }}">{{ r.subject or '(no subject)' }}</a>
+            {% if r.collapsed_count and r.collapsed_count > 1 %}
+              <span class="applybadge" title="Collapsed {{ r.collapsed_count }} threads with this exact subject + sender.">× {{ r.collapsed_count }}</span>
+            {% endif %}
+          </div>
+          <div class="from">{{ r.latest_sender or '' }} · {{ r.mailbox }} · {{ r.conversation_id[-8:] if r.conversation_id else '' }}</div>
+          {% if r.latest_preview %}<div class="help" style="margin-top: 4px; max-width: 720px;">{{ r.latest_preview[:140] }}{% if r.latest_preview|length > 140 %}…{% endif %}</div>{% endif %}
+        </td>
+        <td><span class="vp {{ r.latest_verdict | verdict_class }}">{{ r.latest_verdict }}</span></td>
+        <td class="when">{{ r.msg_count }}</td>
+        <td class="help">{{ r.verdict_count or 0 }} verdict(s){% if r.verdict_count and r.verdict_count > 1 %} <span class="applybadge">changed</span>{% endif %}</td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+</div>
+"""
+
+
+_THREAD_DETAIL_HTML = """\
+<div class="ph">
+  <h1>Thread</h1>
+  <span class="sub">{{ mailbox }} · {{ conversation_id[:24] }}…</span>
+  <div class="actions">
+    <a class="btn" href="/threads?mailbox={{ mailbox }}">← Back to threads</a>
+  </div>
+</div>
+
+<div class="section-label">Verdict timeline ({{ history|length }} classification{{ 's' if history|length != 1 else '' }})</div>
+<div class="table-wrap" style="margin-bottom: 24px;">
+  <table>
+    <thead><tr><th>When</th><th>Verdict</th><th>Trigger</th><th>Size</th><th>Reason</th></tr></thead>
+    <tbody>
+      {% for h in history %}
+      <tr {% if h.prev_verdict and h.prev_verdict != h.verdict_folder %}class="changed-row"{% endif %}>
+        <td class="when">{{ h.decided_at[:19].replace('T',' ') }}</td>
+        <td>
+          {% if h.prev_verdict and h.prev_verdict != h.verdict_folder %}
+            <span class="vp {{ h.prev_verdict | verdict_class }}">{{ h.prev_verdict }}</span>
+            <span class="arrow">→</span>
+          {% endif %}
+          <span class="vp {{ h.verdict_folder | verdict_class }}">{{ h.verdict_folder }}</span>
+        </td>
+        <td>
+          <div class="subj">{{ (h.trigger_subject or '')[:70] }}</div>
+          <div class="from">{{ h.trigger_sender or '' }}</div>
+        </td>
+        <td class="when">{{ h.thread_size }}</td>
+        <td class="help" style="max-width: 360px;">{{ (h.reason or h.model_raw or '')[:240] }}</td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+</div>
+
+<div class="section-label">Messages in thread ({{ decisions|length }})</div>
+<div class="table-wrap">
+  <table>
+    <thead><tr><th>When</th><th>Sender</th><th>Subject</th><th>Verdict</th><th>Tag</th><th>Move</th><th>Error</th></tr></thead>
+    <tbody>
+      {% for d in decisions %}
+      <tr>
+        <td class="when">{{ d.created_at[:19].replace('T',' ') }}</td>
+        <td>{{ d.sender }}</td>
+        <td>{{ (d.subject or '(no subject)')[:80] }}</td>
+        <td><span class="vp {{ d.verdict_folder | verdict_class }}">{{ d.verdict_folder }}</span></td>
+        <td>{% if d.tagged %}✓{% else %}—{% endif %}</td>
+        <td>{% if d.moved %}✓{% else %}—{% endif %}</td>
+        <td class="err-line">{{ d.apply_error or '' }}</td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+</div>
+"""
+
+
+_CHANGES_HTML = """\
+<div class="ph">
+  <h1>Verdict changes</h1>
+  <span class="sub">{{ rows|length }} row(s){% if current_mailbox %} · {{ current_mailbox }}{% endif %}</span>
+  <div class="actions">
+    <form method="get" style="display:inline-flex; gap: 8px; align-items: center;">
+      <select name="mailbox" onchange="this.form.submit()">
+        <option value="">All mailboxes</option>
+        {% for m in sidebar.mailboxes %}<option value="{{ m.mailbox }}" {% if m.mailbox == current_mailbox %}selected{% endif %}>{{ m.mailbox }}</option>{% endfor %}
+      </select>
+      <select name="changes_only" onchange="this.form.submit()">
+        <option value="1" {% if only_changes %}selected{% endif %}>only changes</option>
+        <option value="0" {% if not only_changes %}selected{% endif %}>every classification</option>
+      </select>
+      <select name="limit" onchange="this.form.submit()">
+        {% for n in [100, 200, 500, 1000] %}<option value="{{ n }}" {% if n == limit %}selected{% endif %}>{{ n }}</option>{% endfor %}
+      </select>
+    </form>
+  </div>
+</div>
+
+<div class="table-wrap">
+  <table>
+    <thead><tr><th>When</th><th>Thread (trigger)</th><th>Verdict</th><th>Reason</th></tr></thead>
+    <tbody>
+      {% for r in rows %}
+      <tr>
+        <td class="when">{{ r.decided_at[:19].replace('T',' ') }}</td>
+        <td>
+          <div class="subj"><a href="/threads/{{ r.conversation_id }}?mailbox={{ r.mailbox }}">{{ (r.trigger_subject or '(no subject)')[:80] }}</a></div>
+          <div class="from">{{ r.trigger_sender or '' }} · {{ r.mailbox }} · {{ r.thread_size }} msgs</div>
+        </td>
+        <td>
+          {% if r.prev_verdict %}
+            <span class="vp {{ r.prev_verdict | verdict_class }}">{{ r.prev_verdict }}</span>
+            <span class="arrow">→</span>
+          {% endif %}
+          <span class="vp {{ r.verdict_folder | verdict_class }}">{{ r.verdict_folder }}</span>
+        </td>
+        <td class="help" style="max-width: 420px;">{{ r.reason or r.model_raw or '' }}</td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+</div>
+"""
+
+
+_HIERARCHY_HTML = """\
+<div class="ph">
+  <h1>Taxonomy</h1>
+  <span class="sub">{{ mailbox }}</span>
+  <div class="actions">
+    <a class="btn" href="/mailboxes#mb-{{ mailbox }}">← Back to mailboxes</a>
+  </div>
+</div>
+
+<div class="banner info">
+  Source: <code>{{ path }}</code> — edit this JSON in your fork's <code>src/data/hierarchies/</code>
+  and push to update. The cache invalidates on every feedback submission, so no restart is needed
+  once the file lands in the container.
+</div>
+
+<pre>{{ data | tojson(indent=2) }}</pre>
+"""
+
+
+# --- Feedback review --------------------------------------------------------
+
+_FEEDBACK_REVIEW_HTML = """\
+<div class="ph">
+  <h1>Feedback</h1>
+  <span class="sub">{{ feedback|length }} correction(s){% if proposals %} · {{ proposals|length }} proposal(s){% endif %}</span>
+  <div class="actions">
+    <form method="get" style="display:inline-flex; gap: 8px; align-items: center;">
+      <select name="mailbox" onchange="this.form.submit()">
+        <option value="">All mailboxes</option>
+        {% for m in sidebar.mailboxes %}<option value="{{ m.mailbox }}" {% if m.mailbox == current_mailbox %}selected{% endif %}>{{ m.mailbox }}</option>{% endfor %}
+      </select>
+      <select name="user" onchange="this.form.submit()">
+        <option value="__all__" {% if not current_user %}selected{% endif %}>all users (pooled)</option>
+        {% for u in feedback_users %}
+          <option value="{{ u.user_identifier }}" {% if u.user_identifier == current_user %}selected{% endif %}>{{ u.user_identifier }} · {{ u.n }}</option>
+        {% endfor %}
+      </select>
+    </form>
+    {% if current_mailbox %}
+    <form method="post" action="/feedback-review/{{ current_mailbox }}/propose"
+          onsubmit="this.querySelector('button').disabled = true; this.querySelector('button').textContent='Thinking… (~30s)'; return true;">
+      {% if current_user %}<input type="hidden" name="user_identifier" value="{{ current_user }}">{% endif %}
+      <button type="submit" class="btn pri">↻ Generate proposal</button>
+    </form>
+    {% endif %}
+  </div>
+</div>
+
+<div class="feed-split">
+  <div>
+    <div class="section-label">Recent corrections</div>
+    <div class="table-wrap">
+      <table>
+        <tbody>
+          {% for f in feedback %}
+          <tr>
+            <td class="when" style="width: 110px;">{{ f.created_at[:19].replace('T',' ') }}</td>
+            <td>
+              <div class="subj">{{ (f.subject or '(no subject)')[:70] }}</div>
+              <div class="from">{{ f.mailbox }} · {{ f.user_identifier or '(anonymous)' }}</div>
+              {% if f.note %}<div class="note-block">"{{ f.note }}"</div>{% endif %}
+            </td>
+            <td style="text-align: right; white-space: nowrap;">
+              {% if f.correct %}
+                <span class="vp {{ f.model_choice | verdict_class }}">{{ f.model_choice }}</span>
+              {% else %}
+                <span class="vp {{ f.model_choice | verdict_class }}">{{ f.model_choice }}</span>
+                <span class="arrow">→</span>
+                <span class="vp {{ f.suggested | verdict_class }}">{{ f.suggested }}</span>
+              {% endif %}
+            </td>
+          </tr>
+          {% else %}
+          <tr><td style="text-align: center; padding: 32px; color: var(--t3);">No feedback rows yet.</td></tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+  </div>
+
+  <div>
+    <div class="section-label">Taxonomy proposals</div>
+    {% if not proposals %}
+      <div class="proposal"><div class="help">No proposals yet. Submit some feedback and click "↻ Generate proposal".</div></div>
+    {% endif %}
+    {% for p in proposals %}
+    <div class="proposal {% if not p.applied_at and not p.discarded_at %}pending{% elif p.applied_at %}applied{% else %}discarded{% endif %}">
+      <h5><a href="/feedback-review/proposal/{{ p.id }}" style="color: inherit;">{{ p.mailbox }} · proposal {{ p.id[:8] }}</a></h5>
+      <div class="meta">
+        {{ p.created_at[:19].replace('T',' ') }} · based on {{ p.based_on_feedback_count }} feedback row(s)
+        {% if p.applied_at %} · ✓ applied {{ p.applied_at[:19].replace('T',' ') }}
+        {% elif p.discarded_at %} · ✗ discarded {{ p.discarded_at[:19].replace('T',' ') }}
+        {% else %} · pending review{% endif %}
+      </div>
+      {% if not p.applied_at and not p.discarded_at %}
+      <div class="pa">
+        <form method="post" action="/feedback-review/proposal/{{ p.id }}/apply" style="display:inline"
+              onsubmit="return confirm('Write taxonomy to persistent override path?')">
+          <button class="btn pri" type="submit">✓ Apply</button>
+        </form>
+        <a class="btn" href="/feedback-review/proposal/{{ p.id }}">View diff</a>
+        <form method="post" action="/feedback-review/proposal/{{ p.id }}/discard" style="display:inline">
+          <button class="btn ghost" type="submit">Discard</button>
+        </form>
+      </div>
+      {% endif %}
+    </div>
+    {% endfor %}
+  </div>
+</div>
 """
 
 
 _PROPOSAL_DIFF_HTML = """\
-<!doctype html><title>proposal {{ p.id[:8] }} — email-engine-v2</title>
-<style>
-  body { font: 14px/1.4 -apple-system, system-ui, sans-serif; margin: 1.5rem; max-width: 1100px; }
-  h1, h2 { font-size: 1.1rem; }
-  pre { background: #f5f5f8; padding: 10px 12px; border-radius: 6px;
-        white-space: pre-wrap; word-break: break-word; font-size: 0.82rem;
-        line-height: 1.4; max-height: 420px; overflow: auto; }
-  .cols { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
-  .rationale { background: #fffaf0; border-left: 3px solid #d4a82a;
-               padding: 10px 14px; margin: 12px 0;
-               white-space: pre-wrap; word-break: break-word; }
-  .actions { margin: 12px 0 24px; }
-  .actions form { display: inline-block; margin-right: 8px; }
-  .actions button { padding: 7px 18px; font-size: 0.92rem; }
-  .actions button.apply   { background: #2bb24c; color: #fff; border: none; border-radius: 4px; }
-  .actions button.discard { background: #d84545; color: #fff; border: none; border-radius: 4px; }
-  .help { color: #666; font-size: 0.85rem; }
-  .badge { display: inline-block; padding: 2px 8px; border-radius: 12px;
-           font-size: 0.78rem; margin-left: 4px; }
-  .badge.applied   { background: #d8f0de; color: #196b3a; }
-  .badge.discarded { background: #fbe2e2; color: #b32626; }
-</style>
-""" + _DARK_MODE_CSS + _VERDICT_CSS + _NAV + """\
-<h1>
-  Taxonomy proposal — {{ p.mailbox }}
-  {% if p.applied_at %}<span class="badge applied">applied {{ p.applied_at[:19] }} UTC</span>{% endif %}
-  {% if p.discarded_at %}<span class="badge discarded">discarded {{ p.discarded_at[:19] }} UTC</span>{% endif %}
-</h1>
-<p class="help">Based on {{ p.based_on_feedback_count }} feedback row(s). Created {{ p.created_at[:19] }} UTC.</p>
+<div class="ph">
+  <h1>Proposal {{ p.id[:8] }}</h1>
+  <span class="sub">{{ p.mailbox }} · {{ p.created_at[:19].replace('T',' ') }} · {{ p.based_on_feedback_count }} feedback row(s)</span>
+  <div class="actions">
+    <a class="btn" href="/feedback-review">← Back</a>
+    {% if p.applied_at %}<span class="banner ok" style="margin: 0; padding: 4px 10px;">applied {{ p.applied_at[:19] }} UTC</span>
+    {% elif p.discarded_at %}<span class="banner err" style="margin: 0; padding: 4px 10px;">discarded {{ p.discarded_at[:19] }} UTC</span>
+    {% endif %}
+  </div>
+</div>
 
 {% if p.rationale %}
-<h2>Rationale</h2>
-<div class="rationale">{{ p.rationale }}</div>
+<div class="section-label">Rationale</div>
+<div class="banner info" style="white-space: pre-wrap;">{{ p.rationale }}</div>
 {% endif %}
 
 {% if not p.applied_at and not p.discarded_at %}
-<div class="actions">
-  <form method="post" action="/feedback-review/proposal/{{ p.id }}/apply"
-        onsubmit="return confirm('Write this taxonomy to the persistent override path? The next classification cycle picks it up immediately.')">
-    <button type="submit" class="apply">✓ Apply proposal</button>
+<div class="row-inline" style="margin: 16px 0 24px;">
+  <form method="post" action="/feedback-review/proposal/{{ p.id }}/apply" style="display:inline"
+        onsubmit="return confirm('Write this taxonomy to the persistent override path? Next classification picks it up immediately.')">
+    <button type="submit" class="btn pri">✓ Apply proposal</button>
   </form>
-  <form method="post" action="/feedback-review/proposal/{{ p.id }}/discard">
-    <button type="submit" class="discard">✗ Discard</button>
+  <form method="post" action="/feedback-review/proposal/{{ p.id }}/discard" style="display:inline">
+    <button type="submit" class="btn danger">✗ Discard</button>
   </form>
   <span class="help">Apply writes to <code>/data/hierarchies/&lt;mailbox&gt;.json</code> (persistent volume).</span>
 </div>
 {% endif %}
 
-<h2>Diff</h2>
-<div class="cols">
+<div class="section-label">Diff</div>
+<div style="display: grid; grid-template-columns: 1fr 1fr; gap: 14px;">
   <div>
-    <h3 style="font-size: 0.95rem;">Current</h3>
+    <h3 style="font-size: 13px; color: var(--t3); margin: 0 0 8px; text-transform: uppercase; letter-spacing: 0.05em; font-weight: 600;">Current</h3>
     <pre>{{ p.current_json }}</pre>
   </div>
   <div>
-    <h3 style="font-size: 0.95rem;">Proposed</h3>
+    <h3 style="font-size: 13px; color: var(--t3); margin: 0 0 8px; text-transform: uppercase; letter-spacing: 0.05em; font-weight: 600;">Proposed</h3>
     <pre>{{ p.proposed_json }}</pre>
   </div>
 </div>
 """
 
 
+# --- Test classify ----------------------------------------------------------
+
 _TEST_CLASSIFY_HTML = """\
-<!doctype html><title>test classify — email-engine-v2</title>
-<style>
-  body { font: 14px/1.4 -apple-system, system-ui, sans-serif; margin: 1.5rem; max-width: 1100px; }
-  h1 { font-size: 1.2rem; margin: 0 0 1rem; }
-  table { border-collapse: collapse; width: 100%; }
-  th, td { padding: 6px 8px; border-bottom: 1px solid #eee; vertical-align: top; font-size: 0.88rem; }
-  th { text-align: left; background: #fafafa; }
-  .help { color: #666; font-size: 0.85rem; }
-  .when { color: #777; font-size: 0.8rem; white-space: nowrap; }
-  .subj { font-weight: 600; }
-  button { padding: 4px 10px; font-size: 0.85rem; cursor: pointer; }
-  .test-btn { background: #5b6cff; color: #fff; border: none; border-radius: 3px; }
-  .conv-tail { color: #999; font-family: ui-monospace, monospace; font-size: 0.75rem; }
-  .preview-form { margin-top: 0; padding: 8px 12px; background: #fffaf0;
-                  border-left: 3px solid #d4a82a; border-radius: 3px;
-                  font-size: 0.9rem; margin-bottom: 1rem; }
-  .preview-form label { margin-right: 12px; }
-</style>
-""" + _DARK_MODE_CSS + _VERDICT_CSS + _NAV + """\
-<h1>Test classify</h1>
-<p class="help">Pick a real thread from your connected mailbox history and replay it through the classifier <em>right now</em> — no waiting for new mail, no full reclassify. Pure observation by default (no DB writes); tick "write summary" to also land a real thread_summaries row.</p>
+<div class="ph">
+  <h1>Test classify</h1>
+  <span class="sub">replay a real thread through the classifier</span>
+  <div class="actions">
+    <form method="get" style="display:inline-flex; gap: 6px; align-items: center;">
+      <span class="help">min messages</span>
+      <input type="number" name="min" value="{{ min_msgs }}" min="2" max="500" style="width: 70px;" onchange="this.form.submit()">
+    </form>
+  </div>
+</div>
 
-<form method="get" class="preview-form">
-  <label>Minimum messages in thread:
-    <input type="number" name="min" value="{{ min_msgs }}" min="2" max="500" style="width: 70px"
-           onchange="this.form.submit()">
-  </label>
-  <span class="help">{{ rows|length }} thread(s) shown</span>
-</form>
+<div class="banner info">
+  Pick a real thread from your connected mailbox history and replay it through the classifier <em>right now</em> — no waiting, no full reclassify. Pure observation by default (no DB writes); tick "write summary" to also land a real thread_summaries row.
+</div>
 
-<table>
-  <thead><tr>
-    <th>Mailbox</th><th>Subject</th><th># msgs</th><th>Last activity</th><th></th>
-  </tr></thead>
-  <tbody>
-  {% for r in rows %}
-    <tr>
-      <td>{{ r.mailbox }}</td>
-      <td>
-        <div class="subj">{{ (r.subject or '(no subject)')[:90] }}</div>
-        <div class="conv-tail">{{ r.conversation_id[-12:] }}</div>
-      </td>
-      <td>{{ r.msg_count }}</td>
-      <td class="when">{{ r.last_activity[:19].replace('T',' ') if r.last_activity else '' }}</td>
-      <td>
-        <form method="post" action="/test-classify/run" style="display:inline-flex; gap: 6px; align-items: center;">
-          <input type="hidden" name="mailbox" value="{{ r.mailbox }}">
-          <input type="hidden" name="conversation_id" value="{{ r.conversation_id }}">
-          <label class="help" style="display:inline-flex; gap: 4px; align-items: center;">
-            <input type="checkbox" name="persist" value="1"> write summary
-          </label>
-          <button type="submit" class="test-btn">↻ Test classify</button>
-        </form>
-      </td>
-    </tr>
-  {% endfor %}
-  </tbody>
-</table>
+<div class="table-wrap">
+  <table>
+    <thead><tr><th>Mailbox</th><th>Subject</th><th># msgs</th><th>Last activity</th><th></th></tr></thead>
+    <tbody>
+      {% for r in rows %}
+      <tr>
+        <td>{{ r.mailbox }}</td>
+        <td>
+          <div class="subj">{{ (r.subject or '(no subject)')[:90] }}</div>
+          <div class="from">{{ r.conversation_id[-12:] }}</div>
+        </td>
+        <td class="when">{{ r.msg_count }}</td>
+        <td class="when">{{ r.last_activity[:19].replace('T',' ') if r.last_activity else '' }}</td>
+        <td>
+          <form method="post" action="/test-classify/run" style="display:inline-flex; gap: 6px; align-items: center;">
+            <input type="hidden" name="mailbox" value="{{ r.mailbox }}">
+            <input type="hidden" name="conversation_id" value="{{ r.conversation_id }}">
+            <label class="help" style="display:inline-flex; gap: 4px; align-items: center;">
+              <input type="checkbox" name="persist" value="1"> write
+            </label>
+            <button type="submit" class="btn pri sm">↻ Test</button>
+          </form>
+        </td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+</div>
 """
 
 
 _TEST_RESULT_HTML = """\
-<!doctype html><title>test result — email-engine-v2</title>
-<style>
-  body { font: 14px/1.45 -apple-system, system-ui, sans-serif; margin: 1.5rem; max-width: 1100px; }
-  h1, h2 { font-size: 1.1rem; }
-  pre { background: #f5f5f8; padding: 10px 12px; border-radius: 6px;
-        white-space: pre-wrap; word-break: break-word; font-size: 0.85rem;
-        line-height: 1.4; max-height: 480px; overflow: auto; }
-  .meta { background: #f3f4f8; padding: 10px 14px; border-radius: 6px;
-          margin-bottom: 18px; font-size: 0.9rem; }
-  .meta dt { font-weight: 600; margin-top: 4px; }
-  .meta dd { margin: 0 0 4px 0; color: #444; }
-  .ok   { color: #196b3a; font-weight: 600; }
-  .fail { color: #b32626; font-weight: 600; }
-  .help { color: #666; font-size: 0.85rem; }
-  table.kv { border-collapse: collapse; width: 100%; margin: 8px 0; }
-  table.kv th, table.kv td { padding: 5px 8px; border-bottom: 1px solid #eee;
-                              vertical-align: top; font-size: 0.85rem; text-align: left; }
-  table.kv th { background: #fafafa; font-weight: 600; }
-  .banner { padding: 10px 14px; border-radius: 6px; margin-bottom: 16px; font-weight: 600; }
-  .banner.ok   { background: #e8f8ee; color: #196b3a; border-left: 4px solid #2bb24c; }
-  .banner.fail { background: #fde0e0; color: #b32626; border-left: 4px solid #d84545; }
-</style>
-""" + _DARK_MODE_CSS + _VERDICT_CSS + _NAV + """\
-<h1>Test classify result</h1>
+<div class="ph">
+  <h1>Test result</h1>
+  <span class="sub">{{ mailbox }} · {{ thread_size }} message(s)</span>
+  <div class="actions">
+    <a class="btn" href="/test-classify">← Back</a>
+  </div>
+</div>
 
 {% if verdict.parse_error %}
-<div class="banner fail">
-  ✗ LLM did not return JSON. parse_error: <code>{{ verdict.parse_error }}</code><br>
-  <span class="help" style="font-weight: 400;">→ The response_format=json_object fix is either not deployed yet, or the backend ignored it. Check raw output below.</span>
+<div class="banner err banner-big">
+  ✗ LLM did not return JSON. parse_error: <code>{{ verdict.parse_error }}</code>
 </div>
 {% elif verdict.summary %}
-<div class="banner ok">
-  ✓ LLM returned valid JSON with a summary ({{ verdict.summary|length }} chars).
-  This is the cost-saving strategy working as designed.
+<div class="banner ok banner-big">
+  ✓ LLM returned valid JSON with a summary ({{ verdict.summary|length }} chars). Cost-saving strategy working as designed.
 </div>
 {% else %}
-<div class="banner fail">
-  ⚠ LLM returned JSON but the summary field was empty. Folder verdict still works; cost-saving doesn't kick in.
+<div class="banner err banner-big">
+  ⚠ LLM returned JSON but the summary was empty. Folder verdict still works; cost-saving doesn't kick in.
 </div>
 {% endif %}
 
-<div class="meta">
-  <dl>
-    <dt>Mailbox</dt>           <dd>{{ mailbox }}</dd>
-    <dt>Thread key</dt>        <dd><code>{{ thread_key }}</code></dd>
-    <dt>Conversation id</dt>   <dd><code>{{ conv_id }}</code></dd>
-    <dt>Thread size</dt>       <dd>{{ thread_size }} message(s) fetched from provider</dd>
-    <dt>Latest message</dt>    <dd>{{ latest_msg.subject or '(no subject)' }} — from {{ latest_msg.from_address or latest_msg.from_name }}</dd>
-    <dt>Prior summary used?</dt><dd>{% if used_prior_summary %}<span class="ok">YES</span> — cost-saving path active (full thread NOT re-sent){% else %}<span class="fail">NO</span> — first classification of this thread, full thread context sent{% endif %}</dd>
-    <dt>Model</dt>             <dd><code>{{ model_used }}</code></dd>
-    <dt>Elapsed</dt>           <dd>{{ '%.2f'|format(elapsed_seconds) }}s</dd>
+<div class="section-label">Run metadata</div>
+<div class="table-wrap" style="margin-bottom: 24px;">
+  <table class="kv">
+    <tr><th>Mailbox</th><td>{{ mailbox }}</td></tr>
+    <tr><th>Thread key</th><td><code>{{ thread_key }}</code></td></tr>
+    <tr><th>Conversation id</th><td><code>{{ conv_id }}</code></td></tr>
+    <tr><th>Thread size</th><td>{{ thread_size }} message(s)</td></tr>
+    <tr><th>Latest message</th><td>{{ latest_msg.subject or '(no subject)' }} — from {{ latest_msg.from_address or latest_msg.from_name }}</td></tr>
+    <tr><th>Prior summary used?</th><td>
+      {% if used_prior_summary %}<span style="color: var(--ok); font-weight: 600;">YES</span> — cost-saving active{% else %}<span style="color: var(--err); font-weight: 600;">NO</span> — first classification of this thread{% endif %}
+    </td></tr>
+    <tr><th>Model</th><td><code>{{ model_used }}</code></td></tr>
+    <tr><th>Elapsed</th><td>{{ '%.2f'|format(elapsed_seconds) }}s</td></tr>
     {% if persist %}
-      <dt>Persisted to thread_summaries?</dt>
-      <dd>{% if persisted %}<span class="ok">YES</span> — summary row written{% else %}<span class="fail">NO</span> — write failed (see logs){% endif %}</dd>
+      <tr><th>Persisted?</th><td>{% if persisted %}<span style="color: var(--ok); font-weight: 600;">YES</span>{% else %}<span style="color: var(--err); font-weight: 600;">NO</span> (see logs){% endif %}</td></tr>
     {% else %}
-      <dt>Persisted?</dt><dd>No — dry-run mode (no DB writes)</dd>
+      <tr><th>Persisted?</th><td>No — dry-run mode</td></tr>
     {% endif %}
-  </dl>
+  </table>
 </div>
 
-<h2>Parsed verdict</h2>
-<table class="kv">
-  <tr><th>folder</th><td><span class="verdict {{ verdict.folder | verdict_class }}">{{ verdict.folder }}</span></td></tr>
-  <tr><th>summary</th><td>{{ verdict.summary or '(empty)' }}</td></tr>
-  <tr><th>keyFacts ({{ verdict.key_facts|length }})</th><td>
-    {% if verdict.key_facts %}
-      <ul style="margin:0; padding-left: 18px;">
-      {% for kf in verdict.key_facts %}
-        <li><strong>{{ kf.label }}:</strong> {{ kf.value }}</li>
-      {% endfor %}
-      </ul>
-    {% else %}<span class="help">(empty)</span>{% endif %}
-  </td></tr>
-  <tr><th>timeline ({{ verdict.timeline|length }})</th><td>
-    {% if verdict.timeline %}
-      <ul style="margin:0; padding-left: 18px;">
-      {% for ev in verdict.timeline %}
-        <li><code>{{ ev.date }}</code> — {{ ev.event }}</li>
-      {% endfor %}
-      </ul>
-    {% else %}<span class="help">(empty)</span>{% endif %}
-  </td></tr>
-  <tr><th>contacts ({{ verdict.contacts|length }})</th><td>
-    {% if verdict.contacts %}
-      <ul style="margin:0; padding-left: 18px;">
-      {% for c in verdict.contacts %}
-        <li><strong>{{ c.name or '(unknown)' }}</strong>
-          {% if c.email %}&lt;{{ c.email }}&gt;{% endif %}
-          {% if c.role %} · {{ c.role }}{% endif %}
-          {% if c.organization %} · {{ c.organization }}{% endif %}</li>
-      {% endfor %}
-      </ul>
-    {% else %}<span class="help">(empty)</span>{% endif %}
-  </td></tr>
-</table>
+<div class="section-label">Parsed verdict</div>
+<div class="table-wrap" style="margin-bottom: 24px;">
+  <table class="kv">
+    <tr><th>Folder</th><td><span class="vp {{ verdict.folder | verdict_class }}">{{ verdict.folder }}</span></td></tr>
+    <tr><th>Summary</th><td>{{ verdict.summary or '(empty)' }}</td></tr>
+    <tr><th>Key facts ({{ verdict.key_facts|length }})</th><td>
+      {% if verdict.key_facts %}<ul style="margin: 0; padding-left: 18px;">
+      {% for kf in verdict.key_facts %}<li><strong>{{ kf.label }}:</strong> {{ kf.value }}</li>{% endfor %}
+      </ul>{% else %}<span class="help">(empty)</span>{% endif %}
+    </td></tr>
+    <tr><th>Timeline ({{ verdict.timeline|length }})</th><td>
+      {% if verdict.timeline %}<ul style="margin: 0; padding-left: 18px;">
+      {% for ev in verdict.timeline %}<li><code>{{ ev.date }}</code> — {{ ev.event }}</li>{% endfor %}
+      </ul>{% else %}<span class="help">(empty)</span>{% endif %}
+    </td></tr>
+    <tr><th>Contacts ({{ verdict.contacts|length }})</th><td>
+      {% if verdict.contacts %}<ul style="margin: 0; padding-left: 18px;">
+      {% for c in verdict.contacts %}<li><strong>{{ c.name or '(unknown)' }}</strong>{% if c.email %} &lt;{{ c.email }}&gt;{% endif %}{% if c.role %} · {{ c.role }}{% endif %}{% if c.organization %} · {{ c.organization }}{% endif %}</li>{% endfor %}
+      </ul>{% else %}<span class="help">(empty)</span>{% endif %}
+    </td></tr>
+  </table>
+</div>
 
-<h2>Raw LLM output</h2>
-<p class="help">Should start with <code>{</code> if the JSON-output fix is working. Plain folder names like <code>4-Medium</code> mean the LLM still isn't producing JSON.</p>
+<div class="section-label">Raw LLM output</div>
 <pre>{{ verdict.raw }}</pre>
 
 {% if prior_summary %}
-<h2>Prior summary (what we fed the LLM)</h2>
+<div class="section-label" style="margin-top: 24px;">Prior summary (fed to LLM)</div>
 <pre>{{ prior_summary | tojson(indent=2) }}</pre>
 {% endif %}
-
-<p><a href="/test-classify">← back to thread list</a></p>
 """
 
 
+# --- Public feedback landing (no sidebar, no auth) --------------------------
+
 _FEEDBACK_FORM_HTML = """\
-<!doctype html><meta charset="utf-8"><title>feedback — email-engine</title>
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>feedback · email-engine</title>
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Outfit:wght@400;500;600;700&display=swap" rel="stylesheet">
+""" + _INLINE_STYLE + """
 <style>
-  body { font: 15px/1.5 -apple-system, system-ui, Segoe UI, sans-serif;
-         margin: 0; padding: 0; background: #f6f7fb; color: #222; }
-  .card { max-width: 580px; margin: 4rem auto; background: #fff;
-          border-radius: 12px; padding: 28px 32px;
-          box-shadow: 0 1px 3px rgba(0,0,0,.04), 0 8px 24px rgba(0,0,0,.06); }
-  h1 { font-size: 1.15rem; margin: 0 0 18px; color: #333; }
-  .meta { background: #f3f4f8; border-radius: 8px; padding: 10px 14px;
-          margin-bottom: 20px; font-size: 0.9rem; color: #555; }
-  .meta strong { color: #222; }
-  label { display: block; margin: 14px 0 4px; font-weight: 600; color: #444;
-          font-size: 0.85rem; text-transform: uppercase; letter-spacing: 0.4px; }
-  select, textarea, input[type=text] {
-    width: 100%; padding: 8px 10px; font-size: 0.95rem;
-    border: 1px solid #d4d5dc; border-radius: 6px; box-sizing: border-box;
-    font-family: inherit;
-  }
-  textarea { min-height: 110px; resize: vertical; }
-  .row { display: flex; gap: 10px; align-items: center; margin: 8px 0; }
-  .row label.inline { margin: 0; font-weight: 500; text-transform: none;
-                      letter-spacing: 0; font-size: 0.95rem; color: #333;
-                      display: inline-flex; align-items: center; gap: 8px; }
-  button { margin-top: 18px; padding: 10px 22px; background: #5b6cff;
-           color: #fff; border: none; border-radius: 6px;
-           font-size: 0.95rem; font-weight: 600; cursor: pointer; }
-  button:hover { background: #4456e8; }
-  .help { color: #777; font-size: 0.82rem; margin-top: 4px; }
+  body { display: grid; place-items: center; min-height: 100vh; padding: 24px; }
+  .form-card { max-width: 560px; width: 100%; background: var(--bg2); border: 1px solid var(--bd);
+               border-radius: 3px; padding: 28px 32px; }
+  .form-card h1 { font-size: 18px; font-weight: 600; margin: 0 0 18px; letter-spacing: -0.02em; }
+  .form-card .meta-block { background: var(--surf); border-radius: 3px; padding: 12px 14px;
+                            margin-bottom: 20px; font-size: 13px; color: var(--t2); }
+  .form-card .meta-block strong { color: var(--t1); }
+  .form-card label.row { display: block; margin: 14px 0 4px; color: var(--t3);
+                          font-size: 11.5px; text-transform: uppercase; letter-spacing: 0.05em; font-weight: 600; }
+  .form-card select, .form-card input[type=text], .form-card textarea { width: 100%; }
+  .form-card textarea { min-height: 100px; resize: vertical; }
+  .form-card .pills { display: flex; gap: 10px; margin: 8px 0 12px; }
+  .form-card .pills label { display: inline-flex; align-items: center; gap: 6px;
+                             padding: 8px 14px; border-radius: 3px; border: 1px solid var(--bd);
+                             background: var(--surf); cursor: pointer; color: var(--t1); }
+  .form-card .pills label:has(input:checked) { border-color: var(--ac); background: var(--acSoft); }
 </style>
+</head>
 <body>
-<div class="card">
+<div class="form-card">
   <h1>Was this classification wrong?</h1>
-  <div class="meta">
+  <div class="meta-block">
     <div><strong>Subject:</strong> {{ decision.subject or '(no subject)' }}</div>
     <div><strong>From:</strong> {{ decision.sender or '(unknown)' }}</div>
-    <div><strong>Classified as:</strong> {{ decision.verdict_folder }}</div>
+    <div><strong>Classified as:</strong> <span class="vp {{ decision.verdict_folder | verdict_class }}">{{ decision.verdict_folder }}</span></div>
   </div>
   <form method="post">
-    <div class="row">
-      <label class="inline"><input type="radio" name="correct" value="1" required> ✓ actually correct</label>
-      <label class="inline"><input type="radio" name="correct" value="0" checked> ✗ wrong</label>
+    <div class="pills">
+      <label><input type="radio" name="correct" value="1" required> ✓ actually correct</label>
+      <label><input type="radio" name="correct" value="0" checked> ✗ wrong</label>
     </div>
 
-    <label>What should it have been?</label>
+    <label class="row">What should it have been?</label>
     <select name="suggested">
-      <option value="">(leave blank if it was correct)</option>
+      <option value="">(leave blank if correct)</option>
       {% for f in folders %}
         <option value="{{ f.id or f.name }}" {% if (f.id or f.name) == decision.verdict_folder %}disabled{% endif %}>{{ f.name }}</option>
       {% endfor %}
     </select>
-    <div class="help">Required if you picked ✗ wrong.</div>
+    <div class="help" style="margin-top: 4px;">Required if you picked ✗ wrong.</div>
 
-    <label>Why? (your reasoning helps the next taxonomy update)</label>
-    <textarea name="note" placeholder="e.g. 'sender is internal; thread is about a renewal contract; should always be high-priority not medium'"></textarea>
+    <label class="row">Why? (helps the next taxonomy update)</label>
+    <textarea name="note" placeholder="e.g. 'sender is internal; thread is about renewal; should always be high-priority'"></textarea>
 
-    <label>Your email <span class="help" style="text-transform: none; letter-spacing: 0; font-weight: 400">(so your taxonomy reflects YOUR preferences)</span></label>
-    <input type="text" name="user_identifier" value="{{ prefilled_user }}"
-           placeholder="you@example.com">
+    <label class="row">Your email</label>
+    <input type="text" name="user_identifier" value="{{ prefilled_user }}" placeholder="you@example.com">
+    <div class="help" style="margin-top: 4px;">So your taxonomy reflects YOUR preferences.</div>
 
-    <button type="submit">Submit feedback</button>
+    <button type="submit" class="btn pri" style="margin-top: 18px;">Submit feedback</button>
   </form>
 </div>
 </body>
+</html>
 """
 
+
 _FEEDBACK_DONE_HTML = """\
-<!doctype html><meta charset="utf-8"><title>{{ title }} — email-engine</title>
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>{{ title }} · email-engine</title>
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Outfit:wght@400;500;600;700&display=swap" rel="stylesheet">
+""" + _INLINE_STYLE + """
 <style>
-  body { font: 15px/1.5 -apple-system, system-ui, Segoe UI, sans-serif;
-         margin: 0; padding: 0; background: #f6f7fb; color: #222; }
-  .card { max-width: 480px; margin: 6rem auto; background: #fff;
-          border-radius: 12px; padding: 28px 32px;
-          box-shadow: 0 1px 3px rgba(0,0,0,.04), 0 8px 24px rgba(0,0,0,.06); }
-  h1 { font-size: 1.1rem; margin: 0 0 12px; color: #333; }
-  p  { color: #555; margin: 0; }
+  body { display: grid; place-items: center; min-height: 100vh; padding: 24px; }
+  .done-card { max-width: 480px; width: 100%; background: var(--bg2); border: 1px solid var(--bd);
+               border-radius: 3px; padding: 28px 32px; }
+  .done-card h1 { font-size: 18px; font-weight: 600; margin: 0 0 12px; letter-spacing: -0.02em; }
+  .done-card p { color: var(--t2); margin: 0; line-height: 1.6; }
 </style>
-<body><div class="card"><h1>{{ title }}</h1><p>{{ body }}</p></div></body>
+</head>
+<body>
+<div class="done-card"><h1>{{ title }}</h1><p>{{ body }}</p></div>
+</body>
+</html>
 """
 
 
