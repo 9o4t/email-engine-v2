@@ -2690,8 +2690,12 @@ _MAILBOXES_HTML = """\
       return '✗ search folders (' + when + ') errors=' + s.errors + ' — ' + errs;
     }
     var crts = (s.created_names || []);
+    var ups  = (s.updated_names || []);
     var crtsStr = crts.length ? ' (new: ' + crts.join(', ') + ')' : '';
-    return '✓ search folders (' + when + '): created=' + (s.created||0) + ', existed=' + (s.existed||0) + crtsStr + existing;
+    var upsStr  = ups.length  ? ' (patched: ' + ups.join(', ')  + ')' : '';
+    return '✓ search folders (' + when + '): created=' + (s.created||0) +
+           ', updated=' + (s.updated||0) + ', existed=' + (s.existed||0) +
+           crtsStr + upsStr + existing;
   }
 
   function renderSyncFolders(mb, s) {

@@ -397,10 +397,10 @@ class GraphProvider(Provider):
         return out
 
     def ensure_search_folders(self, names: list[str]) -> dict:
-        """Create one Outlook mail search folder per category name. Each
-        search folder is a saved-query view that auto-lists messages
-        tagged with that category — appears in Outlook's folder tree
-        like a normal folder, no UI dance through the categories
+        """Create or update one Outlook mail search folder per category
+        name. Each search folder is a saved-query view that auto-lists
+        messages tagged with that category — appears in Outlook's folder
+        tree like a normal folder, no UI dance through the categories
         management panel.
 
         Why this is better than relying on the master category list:
@@ -411,39 +411,68 @@ class GraphProvider(Provider):
           - the master category list (and its color UX) becomes optional
             polish rather than the primary affordance
 
-        Idempotent: GETs the current search folders once, POSTs only
-        missing names. Sources the search at msgfolderroot with
-        includeNestedFolders=true so every folder in the mailbox is
-        covered (Inbox, the verdict folders, archive, custom folders).
+        Source = Inbox (with includeNestedFolders=True). NOT
+        msgfolderroot. Why: when a user clicks Archive in Outlook the
+        message moves to the Archive folder, which is a SIBLING of
+        Inbox, not a child. So an Inbox-rooted search folder naturally
+        excludes archived items — operator clears the view by archiving,
+        which is exactly the requested "todo list with archive-to-clear"
+        UX. The verdict folders (1-Critical etc.) live under Inbox so
+        they're included; Sent / Drafts / Junk / Outbox are excluded
+        (they're siblings of Inbox, not children).
 
-        Graph API ref:
-          POST /users/{id}/mailFolders/searchfolders/childFolders
-          body @odata.type = microsoft.graph.mailSearchFolder
-          filterQuery uses OData on the message resource
+        State-convergent (not just create-if-missing): if a search
+        folder with the same name already exists, GET its current
+        sourceFolderIds + filterQuery + includeNestedFolders, and PATCH
+        it back into engine spec when any drift is detected. This means
+        older folders created with the wrong source (e.g.
+        msgfolderroot from an earlier build) get auto-corrected on the
+        next sync click. Only mailSearchFolder typed folders are
+        touched — regular folders with the same name are left alone.
+
+        Graph API refs:
+          POST  /users/{id}/mailFolders/searchfolders/childFolders
+          PATCH /users/{id}/mailFolders/{searchFolderId}
+          docs: https://learn.microsoft.com/en-us/graph/api/mailsearchfolder-post
+                https://learn.microsoft.com/en-us/graph/api/mailsearchfolder-update
 
         Returns counts + error messages in the same shape as
-        ensure_master_categories so the UI plumbing matches."""
+        ensure_master_categories so the UI plumbing matches. `updated`
+        counts drift-corrections (existed-but-needed-PATCH)."""
         list_endpoint = (
             f"{GRAPH_API_BASE}/users/{quote(self._email)}"
             f"/mailFolders/searchfolders/childFolders"
         )
+        single_endpoint_base = (
+            f"{GRAPH_API_BASE}/users/{quote(self._email)}/mailFolders"
+        )
         out: dict = {
-            "created": 0, "existed": 0, "errors": 0,
+            "created": 0, "existed": 0, "updated": 0, "errors": 0,
             "error_messages": [],
             "existing_names": [],
             "created_names": [],
+            "updated_names": [],
         }
 
-        # 1) List current search folders so we don't double-create.
+        # 1) List current search folders WITH their config so we can
+        # detect drift on the ones that already exist.
         try:
+            select = ("id,displayName,@odata.type,filterQuery,"
+                      "sourceFolderIds,includeNestedFolders")
             data = _do_json(
                 self._broker, "GET",
-                list_endpoint + "?$select=id,displayName&$top=100",
+                list_endpoint + f"?$select={select}&$top=100",
             ) or {}
-            existing_list = [c.get("displayName") for c in data.get("value", [])
-                             if c.get("displayName")]
-            existing = set(existing_list)
-            out["existing_names"] = existing_list
+            existing_folders: dict[str, dict] = {}
+            for f in data.get("value", []):
+                # Only consider actual search folders — won't molest
+                # regular folders the user happened to name the same.
+                if "mailSearchFolder" not in (f.get("@odata.type") or ""):
+                    continue
+                disp = f.get("displayName")
+                if disp:
+                    existing_folders[disp] = f
+            out["existing_names"] = list(existing_folders.keys())
         except Exception as e:
             msg = (
                 f"GET searchfolders failed: {e}. "
@@ -455,38 +484,70 @@ class GraphProvider(Provider):
             out["error_messages"].append(msg)
             return out
 
-        # 2) Resolve the msgfolderroot id once. Search folders need at
-        # least one source folder id; rooting at msgfolderroot with
-        # includeNestedFolders=true scans the entire mailbox.
+        # 2) Resolve the Inbox id (sourceFolderIds requires real ids,
+        # not the well-known string "inbox"). With includeNestedFolders
+        # = True this covers Inbox + any subfolders the engine made
+        # (verdict folders) + any custom subfolders the user created.
         try:
-            root_id = self._get_folder_id("msgfolderroot")
-            if not root_id:
-                raise RuntimeError("msgfolderroot returned empty id")
+            inbox_id = self._get_folder_id("inbox")
+            if not inbox_id:
+                raise RuntimeError("inbox returned empty id")
         except Exception as e:
-            msg = f"GET msgfolderroot id failed: {e}"
+            msg = f"GET inbox id failed: {e}"
             log.warning("[%s] %s", self._email, msg)
             out["errors"] += 1
             out["error_messages"].append(msg)
             return out
 
-        # 3) POST each missing search folder.
+        # 3) For each requested name: PATCH if drifted, POST if missing,
+        # skip if already in spec.
+        desired_sources_set = {inbox_id}
         for name in names:
             if not name:
                 continue
-            if name in existing:
-                out["existed"] += 1
+            desired_filter = f"categories/any(c:c eq '{_escape_odata(name)}')"
+
+            existing = existing_folders.get(name)
+            if existing:
+                cur_filter = existing.get("filterQuery") or ""
+                cur_sources = set(existing.get("sourceFolderIds") or [])
+                cur_nested = bool(existing.get("includeNestedFolders"))
+                in_spec = (
+                    cur_filter == desired_filter
+                    and cur_sources == desired_sources_set
+                    and cur_nested is True
+                )
+                if in_spec:
+                    out["existed"] += 1
+                    continue
+                # Drift detected → PATCH back into spec
+                patch_url = f"{single_endpoint_base}/{quote(existing['id'], safe='')}"
+                try:
+                    _do_json(self._broker, "PATCH", patch_url, body={
+                        "includeNestedFolders": True,
+                        "sourceFolderIds": [inbox_id],
+                        "filterQuery": desired_filter,
+                    })
+                    out["updated"] += 1
+                    out["updated_names"].append(name)
+                    log.info(
+                        "[%s] patched search folder %r to inbox-source + canonical filter",
+                        self._email, name,
+                    )
+                except Exception as e:
+                    msg = f"PATCH {name!r}: {e}"
+                    log.exception("[%s] searchfolders %s", self._email, msg)
+                    out["errors"] += 1
+                    out["error_messages"].append(msg)
                 continue
+
+            # Missing → POST to create
             body = {
                 "@odata.type": "microsoft.graph.mailSearchFolder",
                 "displayName": name,
                 "includeNestedFolders": True,
-                "sourceFolderIds": [root_id],
-                # OData filter on the message collection. `categories` is
-                # a Collection(String); /any(c: c eq 'X') is the canonical
-                # collection-equality check in OData v4 / Graph.
-                "filterQuery": (
-                    f"categories/any(c:c eq '{_escape_odata(name)}')"
-                ),
+                "sourceFolderIds": [inbox_id],
+                "filterQuery": desired_filter,
             }
             try:
                 _do_json(self._broker, "POST", list_endpoint, body=body)
@@ -494,13 +555,11 @@ class GraphProvider(Provider):
                 out["created_names"].append(name)
                 log.info(
                     "[%s] created search folder %r filter=%r",
-                    self._email, name, body["filterQuery"],
+                    self._email, name, desired_filter,
                 )
             except Exception as e:
                 msg = f"POST {name!r}: {e}"
-                log.exception(
-                    "[%s] searchfolders %s", self._email, msg,
-                )
+                log.exception("[%s] searchfolders %s", self._email, msg)
                 out["errors"] += 1
                 out["error_messages"].append(msg)
         return out
