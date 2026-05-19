@@ -455,18 +455,23 @@ class GraphProvider(Provider):
         }
 
         # 1) List current search folders WITH their config so we can
-        # detect drift on the ones that already exist. Everything under
-        # the `searchfolders` parent is by definition a mailSearchFolder
-        # (Graph won't let you create regular folders there), so no
-        # @odata.type filter is needed. Note: Graph rejects @odata.type
-        # in $select with a 400 BadRequest — it's an annotation, not a
-        # property — so don't add it back.
+        # detect drift on the ones that already exist.
+        #
+        # No $select: Graph validates $select against the BASE type
+        # `mailFolder`. `filterQuery`, `sourceFolderIds`, and
+        # `includeNestedFolders` are all subtype-specific
+        # (mailSearchFolder) properties, so naming them in $select
+        # returns 400 BadRequest ("Could not find a property named
+        # 'filterQuery' on type 'microsoft.graph.mailFolder'").
+        # Using the cast syntax `microsoft.graph.mailSearchFolder/<prop>`
+        # works but is fiddly; just GET everything — the response is
+        # tiny (≤10 folders typically) and these calls are infrequent.
+        # Everything under the `searchfolders` parent is by definition
+        # a mailSearchFolder so all subtype fields come through.
         try:
-            select = ("id,displayName,filterQuery,"
-                      "sourceFolderIds,includeNestedFolders")
             data = _do_json(
                 self._broker, "GET",
-                list_endpoint + f"?$select={select}&$top=100",
+                list_endpoint + "?$top=100",
             ) or {}
             existing_folders: dict[str, dict] = {}
             for f in data.get("value", []):
