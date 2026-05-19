@@ -396,6 +396,115 @@ class GraphProvider(Provider):
                 out["error_messages"].append(msg)
         return out
 
+    def ensure_search_folders(self, names: list[str]) -> dict:
+        """Create one Outlook mail search folder per category name. Each
+        search folder is a saved-query view that auto-lists messages
+        tagged with that category — appears in Outlook's folder tree
+        like a normal folder, no UI dance through the categories
+        management panel.
+
+        Why this is better than relying on the master category list:
+          - search folders show up directly in the user's folder tree
+            (one click to see "all 1-Critical messages")
+          - they auto-update as the engine tags new mail
+          - they're filterable, sortable, drag-droppable like real folders
+          - the master category list (and its color UX) becomes optional
+            polish rather than the primary affordance
+
+        Idempotent: GETs the current search folders once, POSTs only
+        missing names. Sources the search at msgfolderroot with
+        includeNestedFolders=true so every folder in the mailbox is
+        covered (Inbox, the verdict folders, archive, custom folders).
+
+        Graph API ref:
+          POST /users/{id}/mailFolders/searchfolders/childFolders
+          body @odata.type = microsoft.graph.mailSearchFolder
+          filterQuery uses OData on the message resource
+
+        Returns counts + error messages in the same shape as
+        ensure_master_categories so the UI plumbing matches."""
+        list_endpoint = (
+            f"{GRAPH_API_BASE}/users/{quote(self._email)}"
+            f"/mailFolders/searchfolders/childFolders"
+        )
+        out: dict = {
+            "created": 0, "existed": 0, "errors": 0,
+            "error_messages": [],
+            "existing_names": [],
+            "created_names": [],
+        }
+
+        # 1) List current search folders so we don't double-create.
+        try:
+            data = _do_json(
+                self._broker, "GET",
+                list_endpoint + "?$select=id,displayName&$top=100",
+            ) or {}
+            existing_list = [c.get("displayName") for c in data.get("value", [])
+                             if c.get("displayName")]
+            existing = set(existing_list)
+            out["existing_names"] = existing_list
+        except Exception as e:
+            msg = (
+                f"GET searchfolders failed: {e}. "
+                "If this is a 403 / Forbidden, the Graph app needs "
+                "Mail.ReadWrite (application permission)."
+            )
+            log.warning("[%s] %s", self._email, msg)
+            out["errors"] += 1
+            out["error_messages"].append(msg)
+            return out
+
+        # 2) Resolve the msgfolderroot id once. Search folders need at
+        # least one source folder id; rooting at msgfolderroot with
+        # includeNestedFolders=true scans the entire mailbox.
+        try:
+            root_id = self._get_folder_id("msgfolderroot")
+            if not root_id:
+                raise RuntimeError("msgfolderroot returned empty id")
+        except Exception as e:
+            msg = f"GET msgfolderroot id failed: {e}"
+            log.warning("[%s] %s", self._email, msg)
+            out["errors"] += 1
+            out["error_messages"].append(msg)
+            return out
+
+        # 3) POST each missing search folder.
+        for name in names:
+            if not name:
+                continue
+            if name in existing:
+                out["existed"] += 1
+                continue
+            body = {
+                "@odata.type": "microsoft.graph.mailSearchFolder",
+                "displayName": name,
+                "includeNestedFolders": True,
+                "sourceFolderIds": [root_id],
+                # OData filter on the message collection. `categories` is
+                # a Collection(String); /any(c: c eq 'X') is the canonical
+                # collection-equality check in OData v4 / Graph.
+                "filterQuery": (
+                    f"categories/any(c:c eq '{_escape_odata(name)}')"
+                ),
+            }
+            try:
+                _do_json(self._broker, "POST", list_endpoint, body=body)
+                out["created"] += 1
+                out["created_names"].append(name)
+                log.info(
+                    "[%s] created search folder %r filter=%r",
+                    self._email, name, body["filterQuery"],
+                )
+            except Exception as e:
+                msg = f"POST {name!r}: {e}"
+                log.exception(
+                    "[%s] searchfolders %s", self._email, msg,
+                )
+                out["errors"] += 1
+                out["error_messages"].append(msg)
+        return out
+
     def move_message(self, message_id: str, dest_folder: str) -> str:
         folder_id = self.ensure_folder(dest_folder)
         endpoint = f"{GRAPH_API_BASE}/users/{quote(self._email)}/messages/{quote(message_id, safe='')}/move"

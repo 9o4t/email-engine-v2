@@ -1219,6 +1219,71 @@ def mailboxes_sync_categories_last(email: str):
     return jsonify({"mailbox": email, **r})
 
 
+# In-memory cache for the most recent search-folder sync per mailbox.
+_search_folders_last_sync: dict[str, dict] = {}
+
+
+@app.post("/mailboxes/<path:email>/sync-search-folders")
+@_require_auth
+def mailboxes_sync_search_folders(email: str):
+    """Create Outlook search folders (one per verdict tag) for one
+    mailbox. The search folders auto-list messages by category — much
+    cleaner UX than relying on the master category list:
+      - they appear in Outlook's folder tree directly
+      - users click them like real folders
+      - they auto-update as the engine tags new mail
+      - no Master Category List dependency for filtering
+
+    Runs synchronously, returns counts + error messages in the same
+    shape as sync-categories so the UI plumbing matches."""
+    from providers import make_provider
+    from classifier import list_folders
+
+    mb = store.get_mailbox(email)
+    if not mb:
+        abort(404, "unknown mailbox")
+    if mb.provider != "graph":
+        return Response(status=303, headers={
+            "Location": "/mailboxes?msg=sync-search-folders-noop",
+        })
+
+    try:
+        provider = make_provider(
+            mb.mailbox, mb.provider,
+            imap_server=mb.imap_server, imap_port=mb.imap_port,
+        )
+    except Exception as e:
+        _search_folders_last_sync[email] = {
+            "ok": False, "ran_at": _now_iso(),
+            "created": 0, "existed": 0, "errors": 1,
+            "error_messages": [f"provider construction failed: {e}"],
+            "existing_names": [], "created_names": [],
+        }
+        return Response(status=303, headers={
+            "Location": "/mailboxes?msg=sync-search-folders-failed",
+        })
+
+    current_categories = [f["id"] or f["name"] for f in list_folders(mb.mailbox)]
+    result = provider.ensure_search_folders(current_categories)
+    result["ran_at"] = _now_iso()
+    result["ok"] = result.get("errors", 0) == 0
+    _search_folders_last_sync[email] = result
+    return Response(status=303, headers={
+        "Location": "/mailboxes?msg=sync-search-folders-done",
+    })
+
+
+@app.get("/api/mailboxes/<path:email>/sync-search-folders/last")
+@_require_auth
+def mailboxes_sync_search_folders_last(email: str):
+    """JSON read of the most recent search-folder sync. 404 if never
+    run in this process. Used by the per-card status line JS."""
+    r = _search_folders_last_sync.get(email)
+    if not r:
+        return jsonify({"error": "never_run", "mailbox": email}), 404
+    return jsonify({"mailbox": email, **r})
+
+
 # --- Sweep folder → Inbox ---------------------------------------------------
 
 @app.post("/mailboxes/<path:email>/sweep-to-inbox")
@@ -2282,6 +2347,12 @@ _MAILBOXES_HTML = """\
   <div class="banner">Category sync failed before it could call Graph. See per-mailbox status below.</div>
 {% elif request.args.get('msg') == 'sync-categories-noop' %}
   <div class="banner">Sync skipped — only Graph (Microsoft 365) mailboxes have a Master Category List.</div>
+{% elif request.args.get('msg') == 'sync-search-folders-done' %}
+  <div class="banner ok">Search folders attempted. See per-mailbox status below — once successful, refresh Outlook and look under "Search Folders" in the folder tree.</div>
+{% elif request.args.get('msg') == 'sync-search-folders-failed' %}
+  <div class="banner">Search folder creation failed before it could call Graph. See per-mailbox status below.</div>
+{% elif request.args.get('msg') == 'sync-search-folders-noop' %}
+  <div class="banner">Sync skipped — search folders only apply to Graph (Microsoft 365) mailboxes.</div>
 {% endif %}
 
 {% set active_mbs = mailboxes|selectattr('enabled')|list %}
@@ -2418,9 +2489,15 @@ _MAILBOXES_HTML = """\
       </details>
       <a class="btn sm" href="/hierarchies/{{ m.mailbox }}">View taxonomy</a>
       {% if m.provider == 'graph' %}
+      <form method="post" action="/mailboxes/{{ m.mailbox }}/sync-search-folders" style="display:inline">
+        <button type="submit" class="btn sm"
+                title="Create one Outlook search folder per verdict tag (1-Critical … 5-Low-Ignore). Each folder auto-lists messages tagged with that category — appears in Outlook's folder tree, no Master Category List dependency. Idempotent.">
+          ⊞ Create search folders
+        </button>
+      </form>
       <form method="post" action="/mailboxes/{{ m.mailbox }}/sync-categories" style="display:inline">
         <button type="submit" class="btn sm"
-                title="Register the verdict tags (1-Critical … 5-Low-Ignore) in Outlook's Master Category List with colors. Idempotent. Required for the tags to show up in Outlook → Settings → Categories and to render with color.">
+                title="Register the verdict tags in Outlook's Master Category List with colors. Optional polish — gives the category pills colors in the message list. Search folders are the main filtering affordance.">
           ⊕ Sync categories
         </button>
       </form>
@@ -2445,6 +2522,7 @@ _MAILBOXES_HTML = """\
     </div>
 
     <div class="sweep-status" id="sweep-status-{{ m.mailbox }}"></div>
+    <div class="sweep-status" id="sync-folders-status-{{ m.mailbox }}" style="margin-top: 4px;"></div>
     <div class="sweep-status" id="sync-cats-status-{{ m.mailbox }}" style="margin-top: 4px;"></div>
 
     <div class="reclass" id="reclass-{{ m.mailbox }}">
@@ -2601,10 +2679,39 @@ _MAILBOXES_HTML = """\
     }
   }
 
+  function fmtSyncFolders(s) {
+    if (!s || s.error === 'never_run') return '';
+    var when = s.ran_at ? s.ran_at.slice(11, 19) : '';
+    var existing = (s.existing_names && s.existing_names.length)
+      ? ' · ' + s.existing_names.length + ' pre-existing search folders'
+      : '';
+    if (s.errors && s.errors > 0) {
+      var errs = (s.error_messages || []).join(' · ');
+      return '✗ search folders (' + when + ') errors=' + s.errors + ' — ' + errs;
+    }
+    var crts = (s.created_names || []);
+    var crtsStr = crts.length ? ' (new: ' + crts.join(', ') + ')' : '';
+    return '✓ search folders (' + when + '): created=' + (s.created||0) + ', existed=' + (s.existed||0) + crtsStr + existing;
+  }
+
+  function renderSyncFolders(mb, s) {
+    var el = document.getElementById('sync-folders-status-' + mb);
+    if (!el) return;
+    var txt = fmtSyncFolders(s);
+    if (txt) {
+      el.textContent = txt;
+      el.style.color = (s && s.errors > 0) ? '#b32626' : '#196b3a';
+      el.classList.add('show');
+    } else {
+      el.textContent = '';
+      el.classList.remove('show');
+    }
+  }
+
   var pollMs = 8000;
   function tick() {
     var anyRunning = false;
-    var pending = mailboxes.length * 3;
+    var pending = mailboxes.length * 4;
     if (!pending) { setTimeout(tick, pollMs); return; }
     mailboxes.forEach(function(mb) {
       fetch('/api/reclassify/' + encodeURIComponent(mb) + '/status')
@@ -2621,6 +2728,11 @@ _MAILBOXES_HTML = """\
       fetch('/api/mailboxes/' + encodeURIComponent(mb) + '/sync-categories/last')
         .then(function(r){ return r.ok ? r.json() : null; })
         .then(function(j){ if (j) renderSyncCats(mb, j); })
+        .catch(function(){})
+        .finally(function(){ if (--pending === 0) { pollMs = anyRunning ? 2000 : 8000; setTimeout(tick, pollMs); } });
+      fetch('/api/mailboxes/' + encodeURIComponent(mb) + '/sync-search-folders/last')
+        .then(function(r){ return r.ok ? r.json() : null; })
+        .then(function(j){ if (j) renderSyncFolders(mb, j); })
         .catch(function(){})
         .finally(function(){ if (--pending === 0) { pollMs = anyRunning ? 2000 : 8000; setTimeout(tick, pollMs); } });
     });
