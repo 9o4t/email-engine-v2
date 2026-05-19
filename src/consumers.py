@@ -35,8 +35,26 @@ SYNCT — Thread summary (downstream consumer).
 In addition to the folder verdict, maintain a rolling per-thread summary
 that downstream apps query for human context. Produce these fields:
 
-  - "summary":   2-4 sentence prose describing the thread's CURRENT state
-                 (not a changelog of edits — a snapshot).
+  - "summary":   Write the summary like a real coworker dashing off a
+                 quick Slack-style update to a teammate — natural,
+                 internal-database-note voice.
+                 Rules:
+                   * Start directly with the topic or "Update on…".
+                   * Casual but clear. Contractions are good.
+                   * 1-2 short sentences. Snapshot of CURRENT state,
+                     not a changelog of edits.
+                   * Mention the key action / next step if there is one.
+                   * NO "Summary of…", "The thread concerns…", "This
+                     thread discusses…", "It appears that…", or any
+                     formal hedging. Don't open with the word "Summary".
+                 Examples of the voice you want:
+                   "Crucible Corp 100Gbps dual-circuit deal — waiting
+                    on Spectrotel's second circuit pricing before
+                    paperwork goes out."
+                   "Update on Zeta Solar: Shelley pinged Arelion for
+                    pricing; Eric ready to sign once we have numbers."
+                   "OTP from Microsoft, no action needed."
+
   - "keyFacts":  list of {"label", "value"} pairs worth surfacing
                  (deal name, renewal date, contract amount, customer id,
                  ticket number, etc.). Keep stable facts; update values
