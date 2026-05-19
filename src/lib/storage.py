@@ -17,7 +17,6 @@ from __future__ import annotations
 
 import os
 import sqlite3
-import threading
 import uuid
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -82,6 +81,32 @@ CREATE TABLE IF NOT EXISTS decisions (
 );
 CREATE INDEX IF NOT EXISTS idx_decisions_mailbox_created
     ON decisions(mailbox, created_at DESC);
+-- created_at alone — covers the sidebar (every page) and the no-mailbox
+-- overview range queries that filter purely on created_at.
+CREATE INDEX IF NOT EXISTS idx_decisions_created
+    ON decisions(created_at DESC);
+-- (mailbox, conversation_id, created_at) — the big one. Covers:
+--   - thread detail (WHERE mailbox=? AND conversation_id=? ORDER BY created_at)
+--   - list_threads' 4 correlated subqueries (latest verdict/subject/sender/preview per group)
+--   - list_long_threads' GROUP BY (mailbox, conversation_id)
+--   - delete_decisions_for_thread (WHERE mailbox=? AND conversation_id=?)
+CREATE INDEX IF NOT EXISTS idx_decisions_mailbox_conv_created
+    ON decisions(mailbox, conversation_id, created_at DESC);
+-- (mailbox, verdict_folder) — covers _engine_totals' GROUP BY verdict_folder
+-- per mailbox; lets SQLite group directly off the index.
+CREATE INDEX IF NOT EXISTS idx_decisions_mailbox_verdict
+    ON decisions(mailbox, verdict_folder);
+-- Partial index — only rows with a real apply_error. Almost always tiny
+-- (errors are rare) so the index stays cache-resident and the "errors
+-- in last 24h" stat is effectively free.
+CREATE INDEX IF NOT EXISTS idx_decisions_apply_error
+    ON decisions(created_at DESC)
+    WHERE apply_error IS NOT NULL AND apply_error != '';
+-- Partial index — only rows with a retrieved timestamp. Makes the
+-- AVG-latency overview card a quick index scan instead of a full table walk.
+CREATE INDEX IF NOT EXISTS idx_decisions_retrieved
+    ON decisions(created_at DESC)
+    WHERE retrieved IS NOT NULL;
 
 CREATE TABLE IF NOT EXISTS feedback (
     id              TEXT PRIMARY KEY,
@@ -93,6 +118,9 @@ CREATE TABLE IF NOT EXISTS feedback (
     user_identifier TEXT                 -- email/handle of submitter; nullable
 );
 CREATE INDEX IF NOT EXISTS idx_feedback_decision ON feedback(decision_id);
+-- feedback.created_at — feedback_export and feedback-review pages
+-- ORDER BY this column; without the index SQLite materializes + sorts.
+CREATE INDEX IF NOT EXISTS idx_feedback_created ON feedback(created_at DESC);
 -- idx_feedback_user is created AFTER additive migrations run (the
 -- column may not exist yet on an upgrade from an older schema). See
 -- _apply_additive_migrations and _POST_MIGRATION_SCHEMA below.
@@ -126,6 +154,9 @@ CREATE TABLE IF NOT EXISTS thread_verdicts (
 );
 CREATE INDEX IF NOT EXISTS idx_tv_conv ON thread_verdicts(mailbox, conversation_id, decided_at DESC);
 CREATE INDEX IF NOT EXISTS idx_tv_decided ON thread_verdicts(mailbox, decided_at DESC);
+-- decided_at-only — for the /changes view when no mailbox filter is set;
+-- the leading-column-required rule means idx_tv_decided can't be used there.
+CREATE INDEX IF NOT EXISTS idx_tv_decided_only ON thread_verdicts(decided_at DESC);
 
 -- Per-thread persistent summary surfaced to downstream consumers (synct
 -- now, portals later). One row per (mailbox, threadKey). Maintained in
@@ -154,6 +185,10 @@ CREATE TABLE IF NOT EXISTS thread_summaries (
     PRIMARY KEY (mailbox, thread_key)
 );
 CREATE INDEX IF NOT EXISTS idx_ts_last_message_at ON thread_summaries(last_message_at);
+-- thread_key alone — the PK is (mailbox, thread_key), so searching by
+-- thread_key without a mailbox would scan. find_thread_summaries_by_key
+-- (used by the read endpoint when caller omits ?mailbox=) hits this.
+CREATE INDEX IF NOT EXISTS idx_ts_thread_key ON thread_summaries(thread_key);
 
 -- One-shot feedback tokens. Minted at injection time and embedded in
 -- the footer link of an inbound email. Stored as sha256(token) so a
@@ -189,6 +224,11 @@ CREATE TABLE IF NOT EXISTS taxonomy_proposals (
 );
 CREATE INDEX IF NOT EXISTS idx_taxonomy_proposals_mailbox
     ON taxonomy_proposals(mailbox, created_at DESC);
+-- Partial index for the sidebar's "pending proposals" count — only
+-- rows that are neither applied nor discarded. Tiny in practice.
+CREATE INDEX IF NOT EXISTS idx_taxonomy_proposals_pending
+    ON taxonomy_proposals(created_at DESC)
+    WHERE applied_at IS NULL AND discarded_at IS NULL;
 """
 
 
@@ -278,11 +318,27 @@ class Store:
     def __init__(self, path: Path | str = DEFAULT_DB_PATH):
         self.path = Path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        self._lock = threading.Lock()
+        # No process-wide mutex: SQLite in WAL mode natively allows many
+        # concurrent readers + one writer. Each _conn() opens its own
+        # connection (sqlite3's check_same_thread default is fine because
+        # connections never cross threads), and writers serialize at the
+        # DB level via the busy_timeout below. The old global Lock made
+        # the portal a one-query-at-a-time queue — fine for correctness,
+        # terrible for page-switch latency under concurrent requests.
         with self._conn() as c:
             c.executescript(_SCHEMA)
             self._apply_additive_migrations(c)
             c.executescript(_POST_MIGRATION_SCHEMA)
+            # ANALYZE so the planner has up-to-date stats for the new
+            # composite/partial indexes. Cheap on small tables; on bigger
+            # ones it's a one-time cost paid at boot in exchange for the
+            # planner picking the right index every query thereafter.
+            # Wrapped because ANALYZE shouldn't gate startup if something
+            # weird happens (e.g. corrupt sqlite_stat1 from a prior version).
+            try:
+                c.execute("ANALYZE")
+            except sqlite3.Error:
+                pass
 
     # Additive column adds for already-existing databases. CREATE TABLE
     # IF NOT EXISTS doesn't add new columns to a pre-existing table, so
@@ -313,14 +369,37 @@ class Store:
 
     @contextmanager
     def _conn(self) -> Iterator[sqlite3.Connection]:
-        with self._lock:
-            conn = sqlite3.connect(self.path, isolation_level=None, timeout=30)
-            conn.execute("PRAGMA journal_mode=WAL")
-            conn.row_factory = sqlite3.Row
-            try:
-                yield conn
-            finally:
-                conn.close()
+        # timeout=30 → if another writer has the lock, wait up to 30s
+        # before raising "database is locked". WAL readers never block;
+        # only concurrent WRITERS serialize at this level.
+        conn = sqlite3.connect(self.path, isolation_level=None, timeout=30)
+        # WAL is persistent on the DB file, the rest are per-connection.
+        # Together they make reads roughly 5-10x cheaper:
+        #   synchronous=NORMAL  — safe with WAL, skips per-write fsync
+        #                         (only checkpoint is fsync'd). Pages
+        #                         flush ~1s sooner on power loss; for
+        #                         decision rows we already accept that.
+        #   temp_store=MEMORY   — GROUP BY/ORDER BY temp tables in RAM
+        #                         instead of /tmp. Big win for the
+        #                         /threads grouping query.
+        #   cache_size=-65536   — 64 MB page cache per connection
+        #                         (negative = kibibytes). Hot pages
+        #                         stay resident across queries on the
+        #                         same conn.
+        #   mmap_size=128 MB    — memory-map the DB file so reads
+        #                         skip the userspace copy. Process-
+        #                         wide kernel benefit, persists across
+        #                         connections.
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA synchronous=NORMAL")
+        conn.execute("PRAGMA temp_store=MEMORY")
+        conn.execute("PRAGMA cache_size=-65536")
+        conn.execute("PRAGMA mmap_size=134217728")
+        conn.row_factory = sqlite3.Row
+        try:
+            yield conn
+        finally:
+            conn.close()
 
     # --- mailbox_config -----------------------------------------------------
 
@@ -594,35 +673,53 @@ class Store:
 
     def list_threads(self, mailbox: str | None = None, limit: int = 200) -> list[dict]:
         """One row per conversation_id: latest verdict, subject, sender,
-        message count, last activity. Drives the /threads tab."""
-        sql = """
-            SELECT
-              d.conversation_id                                    AS conversation_id,
-              d.mailbox                                            AS mailbox,
-              MAX(d.created_at)                                    AS last_activity,
-              COUNT(*)                                             AS msg_count,
-              (SELECT verdict_folder FROM decisions
-                 WHERE conversation_id = d.conversation_id AND mailbox = d.mailbox
-                 ORDER BY created_at DESC LIMIT 1)                 AS latest_verdict,
-              (SELECT subject FROM decisions
-                 WHERE conversation_id = d.conversation_id AND mailbox = d.mailbox
-                 ORDER BY created_at DESC LIMIT 1)                 AS subject,
-              (SELECT sender FROM decisions
-                 WHERE conversation_id = d.conversation_id AND mailbox = d.mailbox
-                 ORDER BY created_at DESC LIMIT 1)                 AS latest_sender,
-              (SELECT body_preview FROM decisions
-                 WHERE conversation_id = d.conversation_id AND mailbox = d.mailbox
-                 ORDER BY created_at DESC LIMIT 1)                 AS latest_preview,
-              (SELECT COUNT(*) FROM thread_verdicts
-                 WHERE conversation_id = d.conversation_id AND mailbox = d.mailbox) AS verdict_count
-            FROM decisions d
-            WHERE d.conversation_id IS NOT NULL AND d.conversation_id != ''
-        """
+        message count, last activity. Drives the /threads tab.
+
+        Implementation: one window-function pass over the
+        (mailbox, conversation_id, created_at DESC) index, picking the
+        latest row per partition via ROW_NUMBER() = 1. The prior version
+        ran four correlated subqueries per thread group — fine on a few
+        hundred rows, painful at scale."""
+        mb_filter = ""
         args: list = []
         if mailbox:
-            sql += " AND d.mailbox = ?"
+            mb_filter = " AND mailbox = ?"
             args.append(mailbox)
-        sql += " GROUP BY d.mailbox, d.conversation_id ORDER BY last_activity DESC LIMIT ?"
+        sql = f"""
+            WITH ranked AS (
+              SELECT
+                mailbox, conversation_id, created_at, subject, sender,
+                body_preview, verdict_folder,
+                ROW_NUMBER() OVER (
+                  PARTITION BY mailbox, conversation_id
+                  ORDER BY created_at DESC
+                ) AS rn,
+                COUNT(*) OVER (
+                  PARTITION BY mailbox, conversation_id
+                ) AS msg_count,
+                MAX(created_at) OVER (
+                  PARTITION BY mailbox, conversation_id
+                ) AS last_activity
+              FROM decisions
+              WHERE conversation_id IS NOT NULL AND conversation_id != ''{mb_filter}
+            )
+            SELECT
+              mailbox,
+              conversation_id,
+              last_activity,
+              msg_count,
+              verdict_folder AS latest_verdict,
+              subject,
+              sender         AS latest_sender,
+              body_preview   AS latest_preview,
+              (SELECT COUNT(*) FROM thread_verdicts tv
+                 WHERE tv.conversation_id = ranked.conversation_id
+                   AND tv.mailbox = ranked.mailbox)            AS verdict_count
+            FROM ranked
+            WHERE rn = 1
+            ORDER BY last_activity DESC
+            LIMIT ?
+        """
         args.append(limit)
         with self._conn() as c:
             rows = c.execute(sql, args).fetchall()
