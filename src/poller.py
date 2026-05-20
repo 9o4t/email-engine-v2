@@ -576,6 +576,23 @@ def reclassify_all(
         "errors": 0,
         "current_folder": None,
         "cursor_received_at": None,
+        # Diagnostic counters. Without these, "0 threads classified" is
+        # ambiguous between (a) the descending walker hit `stop_at` on
+        # the first message of every folder — i.e., no mail received in
+        # the last N days — vs (b) every list_folder call errored, vs
+        # (c) every conversation was already in `seen` (folder-straddle
+        # dedup). messages_walked counts every Message object actually
+        # inspected; messages_skipped_old fires the days_back cutoff;
+        # messages_skipped_dedup fires the cross-folder dedup. They sum
+        # to (messages_walked + skipped_*) per page.
+        "messages_walked": 0,
+        "messages_skipped_old": 0,
+        "messages_skipped_dedup": 0,
+        # Folders the walker bailed on because the very first message
+        # was already older than stop_at — strong signal that days_back
+        # is set tighter than any mail you actually have.
+        "folders_empty_or_old": 0,
+        "per_folder": {},
     }
     if progress is not None:
         progress.update(counts)
@@ -599,9 +616,14 @@ def reclassify_all(
             break
         counts["folders_walked"] += 1
         counts["current_folder"] = folder
+        folder_stats = {"walked": 0, "classified": 0, "skipped_old": 0,
+                        "skipped_dedup": 0, "errors": 0,
+                        "oldest_received_at": None}
+        counts["per_folder"][folder] = folder_stats
         if progress is not None:
             progress["folders_walked"] = counts["folders_walked"]
             progress["current_folder"] = folder
+            progress["per_folder"] = counts["per_folder"]
         # Walk NEWEST → OLDEST so the dashboard fills up with recognizable
         # recent threads first; cursor tracks the OLDEST received_at seen
         # so the next page asks for messages strictly older than that.
@@ -616,6 +638,7 @@ def reclassify_all(
             except Exception as e:
                 log.exception("[reclassify] list %s failed: %s", folder, e)
                 counts["errors"] += 1
+                folder_stats["errors"] += 1
                 break
             if not batch:
                 break
@@ -623,15 +646,26 @@ def reclassify_all(
             for m in batch:
                 if _STOP:
                     break
+                counts["messages_walked"] += 1
+                folder_stats["walked"] += 1
+                if m.received_at and (
+                    folder_stats["oldest_received_at"] is None
+                    or m.received_at.isoformat() < folder_stats["oldest_received_at"]
+                ):
+                    folder_stats["oldest_received_at"] = m.received_at.isoformat()
                 # Honor days_back: stop once we walk past the cutoff. We
                 # still update the cursor so the break propagates cleanly.
                 if stop_at and m.received_at and m.received_at < stop_at:
                     log.info("[reclassify] hit stop_at (%s) in %s — stopping folder walk",
                              stop_at.isoformat(), folder)
                     cursor = m.received_at
+                    counts["messages_skipped_old"] += 1
+                    folder_stats["skipped_old"] += 1
                     hit_stop = True
                     break
                 if m.conversation_id and m.conversation_id in seen:
+                    counts["messages_skipped_dedup"] += 1
+                    folder_stats["skipped_dedup"] += 1
                     if m.received_at and (cursor is None or m.received_at < cursor):
                         cursor = m.received_at
                     continue
@@ -640,21 +674,36 @@ def reclassify_all(
                 try:
                     _classify_thread_and_apply(provider, mb, m, store, llm, rule_categories)
                     counts["threads_classified"] += 1
+                    folder_stats["classified"] += 1
                 except Exception as e:
                     log.exception("[reclassify] %s/%s thread failed: %s",
                                   folder, m.id[:24], e)
                     counts["errors"] += 1
+                    folder_stats["errors"] += 1
                 if m.received_at and (cursor is None or m.received_at < cursor):
                     cursor = m.received_at
                 # Mirror live state out to the web UI's progress dict.
                 if progress is not None:
                     progress["threads_classified"] = counts["threads_classified"]
                     progress["errors"] = counts["errors"]
+                    progress["messages_walked"] = counts["messages_walked"]
+                    progress["messages_skipped_old"] = counts["messages_skipped_old"]
+                    progress["messages_skipped_dedup"] = counts["messages_skipped_dedup"]
                     progress["cursor_received_at"] = cursor.isoformat() if cursor else None
             if hit_stop or len(batch) < page:
                 break
-        log.info("[reclassify] folder %s done (threads=%d errors=%d)",
-                 folder, counts["threads_classified"], counts["errors"])
+        # If we never walked anything OR the very first message was
+        # already too old, that's the smoking gun for a tight days_back.
+        if folder_stats["walked"] == 0 or (
+            folder_stats["walked"] > 0
+            and folder_stats["classified"] == 0
+            and folder_stats["skipped_old"] > 0
+        ):
+            counts["folders_empty_or_old"] += 1
+        log.info("[reclassify] folder %s done (walked=%d threads=%d skipped_old=%d skipped_dedup=%d errors=%d oldest=%s)",
+                 folder, folder_stats["walked"], folder_stats["classified"],
+                 folder_stats["skipped_old"], folder_stats["skipped_dedup"],
+                 folder_stats["errors"], folder_stats["oldest_received_at"])
 
     # Watermark stays at `started_at` — any message received during the
     # reclassify run is strictly newer than that and gets picked up by the

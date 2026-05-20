@@ -2543,6 +2543,14 @@ _MAILBOXES_HTML = """\
         <span>folder <b id="reclass-folders-{{ m.mailbox }}">0/0</b></span>
         <span id="reclass-curfolder-{{ m.mailbox }}">starting…</span>
       </div>
+      <div class="meta" id="reclass-diag-{{ m.mailbox }}" style="opacity: 0.8;">
+        <span><b id="reclass-walked-{{ m.mailbox }}">0</b> walked</span>
+        <span><b id="reclass-skipold-{{ m.mailbox }}">0</b> skipped (older than window)</span>
+        <span><b id="reclass-skipdedup-{{ m.mailbox }}">0</b> skipped (dedup)</span>
+        <span><b id="reclass-errors-{{ m.mailbox }}">0</b> errors</span>
+        <span>oldest seen: <b id="reclass-oldest-{{ m.mailbox }}">—</b></span>
+      </div>
+      <div class="meta" id="reclass-hint-{{ m.mailbox }}" style="display:none; color: var(--warn, #d4a154); font-size: 11.5px;"></div>
     </div>
   </div>
 {% endmacro %}
@@ -2632,6 +2640,31 @@ _MAILBOXES_HTML = """\
       pct = 100;
     }
     set('reclass-pct-' + mb, Math.round(pct) + '%');
+    // Diagnostics — surface what the walker actually saw so a "0 threads
+    // classified" result is no longer a black box. The hint banner below
+    // tells the user *why* it was 0 (cutoff vs errors vs empty folders).
+    set('reclass-walked-' + mb,    String(p.messages_walked        || 0));
+    set('reclass-skipold-' + mb,   String(p.messages_skipped_old   || 0));
+    set('reclass-skipdedup-' + mb, String(p.messages_skipped_dedup || 0));
+    set('reclass-errors-' + mb,    String(p.errors                 || 0));
+    set('reclass-oldest-' + mb,    p.cursor_received_at ? p.cursor_received_at.slice(0, 19).replace('T', ' ') + 'Z' : '—');
+    var hint = document.getElementById('reclass-hint-' + mb);
+    if (hint && !s.running) {
+      var msg = '';
+      if ((p.errors || 0) > 0 && (p.threads_classified || 0) === 0) {
+        msg = 'Every folder errored before any classification ran — check Railway logs for [reclassify] exceptions.';
+      } else if ((p.threads_classified || 0) === 0 && (p.messages_walked || 0) === 0) {
+        msg = 'No messages walked. INBOX + legacy folders are empty (or none exist on this mailbox).';
+      } else if ((p.threads_classified || 0) === 0
+                 && (p.messages_skipped_old || 0) > 0
+                 && s.days_back) {
+        msg = 'Every message inspected was older than the ' + s.days_back + '-day window — try a wider range (or "all") if you want to reprocess older mail.';
+      } else if ((p.threads_classified || 0) === 0 && (p.messages_skipped_dedup || 0) > 0) {
+        msg = 'Every conversation was already covered by another folder — nothing new to classify.';
+      }
+      if (msg) { hint.textContent = msg; hint.style.display = ''; }
+      else     { hint.textContent = ''; hint.style.display = 'none'; }
+    }
     var bar = document.getElementById('reclass-bar-' + mb);
     if (bar) bar.style.width = pct + '%';
     set('reclass-threads-' + mb, String(p.threads_classified || 0));
