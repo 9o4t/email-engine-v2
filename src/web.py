@@ -2472,7 +2472,14 @@ _MAILBOXES_HTML = """\
 
     <div class="toolbar-row">
       <details>
-        <summary><button type="button" class="btn sm">↻ Reclassify…</button></summary>
+        {# `class="btn sm"` is applied to <summary> directly. Nesting a
+           <button> inside <summary> is invalid HTML — Chromium-based
+           browsers (Edge, recent Chrome) capture the click on the inner
+           button and the details element never toggles, hiding the day-
+           range picker entirely. The CSS above already strips the
+           default disclosure marker so styling the summary as a button
+           is the canonical fix. Same pattern applied to "Sweep" below. #}
+        <summary class="btn sm">↻ Reclassify…</summary>
         <div class="details-body">
           <form method="post" action="/mailboxes/{{ m.mailbox }}/reclassify"
                 onsubmit="return confirm('Reclassify {{ m.mailbox }}? ' + (this.days_back.value ? 'Last ' + this.days_back.value + ' day(s)' : 'ALL history') + '.')">
@@ -2503,7 +2510,7 @@ _MAILBOXES_HTML = """\
       </form>
       {% endif %}
       <details>
-        <summary><button type="button" class="btn sm">Sweep folder → Inbox</button></summary>
+        <summary class="btn sm">Sweep folder → Inbox</summary>
         <div class="details-body">
           <form method="post" action="/mailboxes/{{ m.mailbox }}/sweep-to-inbox"
                 onsubmit="return confirm('Move every message in &quot;' + this.from_folder.value + '&quot; to Inbox?')">
