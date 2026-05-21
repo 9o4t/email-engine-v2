@@ -1872,6 +1872,7 @@ tbody tr:last-child td { border-bottom: none; }
               border-radius: 3px; font-size: 11.5px; cursor: pointer;
               font-family: inherit; }
 .pill-row { display: flex; gap: 4px; flex-wrap: wrap; }
+.fb-stack { display: flex; flex-direction: column; gap: 4px; align-items: flex-start; }
 
 /* Mailbox cards */
 .mb-grid { display: grid; grid-template-columns: 1fr; gap: 14px; }
@@ -2266,23 +2267,26 @@ _DECISIONS_HTML = """\
           </div>
         </td>
         <td>
-          <div class="pill-row">
-            <form method="post" action="/feedback" style="display: inline">
-              <input type="hidden" name="decision_id" value="{{ d.id }}">
-              <input type="hidden" name="correct" value="1">
-              <button class="pill-right" type="submit">✓ right</button>
-            </form>
-            <form method="post" action="/feedback" style="display: inline-flex; gap: 4px; align-items: center;">
-              <input type="hidden" name="decision_id" value="{{ d.id }}">
-              <input type="hidden" name="correct" value="0">
-              <select name="suggested" required style="font-size: 11.5px; padding: 3px 6px;">
-                <option value="" disabled selected>move to…</option>
-                {% for f in folders %}
-                  <option value="{{ f.id or f.name }}">{{ f.name }}</option>
-                {% endfor %}
-              </select>
-              <button class="pill-wrong" type="submit">✗ wrong</button>
-            </form>
+          <div class="fb-stack">
+            <div class="pill-row">
+              <form method="post" action="/feedback" style="display: inline">
+                <input type="hidden" name="decision_id" value="{{ d.id }}">
+                <input type="hidden" name="correct" value="1">
+                <button class="pill-right" type="submit">✓ right</button>
+              </form>
+              <form method="post" action="/feedback" id="wrong-{{ d.id }}" style="display: inline">
+                <input type="hidden" name="decision_id" value="{{ d.id }}">
+                <input type="hidden" name="correct" value="0">
+                <button class="pill-wrong" type="submit">✗ wrong</button>
+              </form>
+            </div>
+            <select form="wrong-{{ d.id }}" name="suggested" required
+                    style="font-size: 11.5px; padding: 3px 6px; max-width: 100%;">
+              <option value="" disabled selected>move to…</option>
+              {% for f in folders %}
+                <option value="{{ f.id or f.name }}">{{ f.name }}</option>
+              {% endfor %}
+            </select>
           </div>
         </td>
       </tr>
